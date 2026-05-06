@@ -213,49 +213,40 @@ export class TransactionsService {
   ): Promise<void> {
     const client = this.supabaseService.getServiceRoleClient();
     const submittedAt = new Date().toISOString();
-    const { error } = await client.from('transactions').insert({
+    const transactionHashPayload: Record<string, unknown> = {
       user_wallet: wallet,
       transaction_hash: hash,
       type,
       status: 'pending',
       xdr,
-      submitted_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    });
+      submitted_at: submittedAt,
+      updated_at: submittedAt,
+    };
+    const { error: transactionHashError } = await client
+      .from('transactions')
+      .insert(transactionHashPayload);
 
-    const payloads = [
-      {
-        hash,
-        user_wallet: wallet,
-        type,
-        status: 'pending',
-        submitted_at: submittedAt,
-      },
-      {
-        transaction_hash: hash,
-        user_wallet: wallet,
-        type,
-        status: 'pending',
-        submitted_at: submittedAt,
-      },
-    ];
-
-    let lastError: { message?: string } | null = null;
-
-    for (const payload of payloads) {
-      const { error } = await client.from('transactions').insert(payload);
-      if (!error) {
-        return;
-      }
-
-      lastError = error;
-      if (!this.isUnknownColumnError(error)) {
-        break;
-      }
+    if (!transactionHashError) {
+      return;
     }
 
-    if (lastError) {
-      throw new Error(lastError.message ?? 'Supabase insert failed');
+    if (!this.isUnknownColumnError(transactionHashError)) {
+      throw new Error(transactionHashError.message ?? 'Supabase insert failed');
+    }
+
+    const legacyHashPayload: Record<string, unknown> = {
+      user_wallet: wallet,
+      hash,
+      type,
+      status: 'pending',
+      xdr,
+      submitted_at: submittedAt,
+      updated_at: submittedAt,
+    };
+    const { error: legacyHashError } = await client.from('transactions').insert(legacyHashPayload);
+
+    if (legacyHashError) {
+      throw new Error(legacyHashError.message ?? 'Supabase insert failed');
     }
   }
 
