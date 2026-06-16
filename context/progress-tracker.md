@@ -44,6 +44,12 @@ EAS build for Expo preview → then landing page → then GitHub issues → then
 ### Documentation
 - `README.md` fully rewritten as StepFi-Contracts
 
+### CI Pipeline
+- Created `.github/workflows/ci.yml` — runs on push/PR to `main`
+- Steps: checkout → setup Node 20 → `npm ci` → `npm run build` → `npm test`
+- `node_modules` cached via `actions/cache@v4` keyed on `package-lock.json` hash
+- CI status badge added to `README.md` pointing at the workflow
+
 ---
 
 ## In Progress
