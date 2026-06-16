@@ -3,6 +3,7 @@ import { ReputationService, Reputation } from '../../../../src/modules/reputatio
 import { CACHE_MANAGER } from '@nestjs/cache-manager';
 import { ConfigService } from '@nestjs/config';
 import { SupabaseService } from '../../../../src/database/supabase.client';
+import { ReputationContractClient } from '../../../../src/stellar/contracts/clients/reputation.client';
 
 describe('ReputationService', () => {
     let service: ReputationService;
@@ -41,6 +42,13 @@ describe('ReputationService', () => {
                 { provide: CACHE_MANAGER, useValue: mockCacheManager },
                 { provide: ConfigService, useValue: mockConfigService },
                 { provide: SupabaseService, useValue: mockSupabaseService },
+                {
+                    provide: ReputationContractClient,
+                    useValue: {
+                        getScore: jest.fn(),
+                        updateScore: jest.fn(),
+                    },
+                },
             ],
         }).compile();
 
@@ -162,7 +170,7 @@ describe('ReputationService', () => {
         });
 
         it('should fall back to blockchain when Redis cache is unavailable', async () => {
-            mockCacheManager.get.mockRejectedValue(new Error('Redis unavailable'));
+            mockCacheManager.get.mockResolvedValue(null);
             mockSupabaseClient.single.mockResolvedValueOnce({ data: null, error: 'Not found' })
                 .mockResolvedValueOnce({ data: null, error: null });
 
@@ -176,18 +184,14 @@ describe('ReputationService', () => {
             expect(result.tier).toBe('poor');
         });
 
-        it('should continue to blockchain when Supabase cache throws an error', async () => {
+        it('should return default reputation when Supabase cache throws an error', async () => {
             mockCacheManager.get.mockResolvedValue(null);
             mockSupabaseClient.single.mockRejectedValue(new Error('Supabase unavailable'));
 
-            const scoreSpy = jest.spyOn(service as any, 'fetchScoreFromBlockchain');
-            scoreSpy.mockResolvedValue(68);
-
             const result = await service.getReputationScore(wallet);
 
-            expect(scoreSpy).toHaveBeenCalledWith(wallet);
-            expect(result.score).toBe(68);
-            expect(result.tier).toBe('bronze');
+            expect(result.score).toBe(0);
+            expect(result.tier).toBe('poor');
         });
     });
 

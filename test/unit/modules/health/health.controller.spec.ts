@@ -9,6 +9,7 @@ describe('HealthController', () => {
   const mockHealthService = {
     check: jest.fn(),
     checkDatabase: jest.fn(),
+    checkDatabaseMinimal: jest.fn(),
   };
 
   beforeEach(async () => {
@@ -60,12 +61,12 @@ describe('HealthController', () => {
         timestamp: new Date().toISOString(),
       };
 
-      mockHealthService.checkDatabase.mockResolvedValue(expectedResult);
+      mockHealthService.checkDatabaseMinimal.mockResolvedValue(expectedResult);
 
       const result = await controller.checkDatabase();
 
       expect(result).toEqual(expectedResult);
-      expect(healthService.checkDatabase).toHaveBeenCalledTimes(1);
+      expect(healthService.checkDatabaseMinimal).toHaveBeenCalledTimes(1);
     });
   });
 });
