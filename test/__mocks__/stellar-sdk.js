@@ -9,11 +9,21 @@ module.exports = {
     fromSecret: jest.fn(() => ({
       publicKey: jest.fn(() => 'GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW'),
     })),
+    fromPublicKey: jest.fn(() => ({
+      verify: jest.fn(() => true),
+      publicKey: jest.fn(() => 'GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW'),
+    })),
     random: jest.fn(() => ({
+      sign: jest.fn(() => Buffer.alloc(64)),
+      verify: jest.fn(() => true),
       publicKey: jest.fn(() => 'GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW'),
       secret: jest.fn(() => 'SABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVWXYZ'),
     })),
   },
+  Account: jest.fn((publicKey, sequence) => ({
+    accountId: () => publicKey,
+    sequenceNumber: () => sequence,
+  })),
   StrKey: {
     isValidEd25519PublicKey: jest.fn(() => true),
     isValidEd25519SecretSeed: jest.fn(() => true),
@@ -30,6 +40,17 @@ module.exports = {
       prepareTransaction: jest.fn(),
       sendTransaction: jest.fn(),
       getTransaction: jest.fn(),
+    })),
+  },
+  Horizon: {
+    Server: jest.fn(() => ({
+      loadAccount: jest.fn(),
+      submitTransaction: jest.fn(),
+      transactions: jest.fn(() => ({
+        transaction: jest.fn(() => ({
+          call: jest.fn().mockResolvedValue({}),
+        })),
+      })),
     })),
   },
   BASE_FEE: '100',
