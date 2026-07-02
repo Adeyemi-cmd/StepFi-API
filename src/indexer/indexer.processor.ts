@@ -30,13 +30,19 @@ export class IndexerProcessor extends WorkerHost {
   private readonly logger = new Logger(IndexerProcessor.name);
 
   /**
-   * Soroban RPC only retains contract events for a limited window of recent
-   * ledgers. If our stored cursor falls further behind the network head than
-   * this, the RPC rejects `getEvents` with
-   * "startLedger must be within the ledger range". We keep this safety margin
-   * below the head and fast-forward the cursor to it when needed.
+   * How far behind the network head a cursor may fall before we treat it as
+   * stale. Soroban RPC only retains contract events for a limited window of
+   * recent ledgers; once the cursor drops more than this below the head, the RPC
+   * rejects `getEvents` with "startLedger must be within the ledger range".
    */
   private static readonly LEDGER_RETENTION_BUFFER = 100_000;
+
+  /**
+   * When a stale cursor is healed, how far below the network head we jump to.
+   * A small buffer keeps the catch-up point comfortably inside the retention
+   * window so recovery completes in a single cycle.
+   */
+  private static readonly CATCH_UP_BUFFER = 1_000;
 
   private readonly loanContractId: string;
   private readonly reputationContractId: string;
@@ -431,8 +437,9 @@ export class IndexerProcessor extends WorkerHost {
    * Proactively fast-forwards a stale cursor.
    *
    * A checkpoint that has fallen too far behind the network head would be
-   * rejected by the RPC, so we advance both the start ledger we return and the
-   * persisted cursor to a safe point just inside the retention window.
+   * rejected by the RPC. When that happens we jump close to the network head
+   * (leaving a small buffer inside the retention window) so the indexer catches
+   * up in a single cycle rather than crawling forward.
    *
    * @returns The ledger the caller should start fetching from.
    */
@@ -463,19 +470,23 @@ export class IndexerProcessor extends WorkerHost {
       return startLedger;
     }
 
+    // Too far behind to recover full history from the RPC, so jump close to the
+    // network head and catch up in a single cycle.
+    const catchUpLedger = latestLedger - IndexerProcessor.CATCH_UP_BUFFER;
+
     this.logger.warn({
       context: 'IndexerProcessor',
       action: 'healStaleCursor',
       label,
       startLedger,
-      minValidLedger,
+      catchUpLedger,
       latestLedger,
-    }, `Stale ledger checkpoint for ${label}: ${startLedger} is below minimum valid ${minValidLedger}. Fast-forwarding.`);
+    }, `Stale cursor detected for ${label}. Jumping from ${startLedger} directly to ${catchUpLedger} (latest: ${latestLedger})`);
 
-    // Persist (minValidLedger - 1) so the next resume starts exactly at
-    // minValidLedger, matching the cursor+1 semantics used elsewhere.
-    await this.updateCursor(contractId, minValidLedger - 1);
-    return minValidLedger;
+    // Persist (catchUpLedger - 1) so the next resume starts exactly at
+    // catchUpLedger, matching the cursor+1 semantics used elsewhere.
+    await this.updateCursor(contractId, catchUpLedger - 1);
+    return catchUpLedger;
   }
 
   /**
