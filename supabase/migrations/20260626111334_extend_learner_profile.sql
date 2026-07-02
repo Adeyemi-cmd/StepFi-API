@@ -2,7 +2,7 @@ ALTER TABLE learner_profiles ADD COLUMN IF NOT EXISTS full_name VARCHAR(100);
 ALTER TABLE learner_profiles ADD COLUMN IF NOT EXISTS bio TEXT;
 ALTER TABLE learner_profiles ADD COLUMN IF NOT EXISTS country VARCHAR(60);
 ALTER TABLE learner_profiles ADD COLUMN IF NOT EXISTS city VARCHAR(60);
-ALTER TABLE learner_profiles ADD COLUMN IF NOT EXISTS current_role VARCHAR(50);
+ALTER TABLE learner_profiles ADD COLUMN IF NOT EXISTS "current_role" VARCHAR(50);
 ALTER TABLE learner_profiles ADD COLUMN IF NOT EXISTS institution VARCHAR(100);
 ALTER TABLE learner_profiles ADD COLUMN IF NOT EXISTS program VARCHAR(100);
 ALTER TABLE learner_profiles ADD COLUMN IF NOT EXISTS graduation_year INTEGER;
