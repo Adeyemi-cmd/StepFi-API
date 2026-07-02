@@ -29,6 +29,15 @@ import {
 export class IndexerProcessor extends WorkerHost {
   private readonly logger = new Logger(IndexerProcessor.name);
 
+  /**
+   * Soroban RPC only retains contract events for a limited window of recent
+   * ledgers. If our stored cursor falls further behind the network head than
+   * this, the RPC rejects `getEvents` with
+   * "startLedger must be within the ledger range". We keep this safety margin
+   * below the head and fast-forward the cursor to it when needed.
+   */
+  private static readonly LEDGER_RETENTION_BUFFER = 100_000;
+
   private readonly loanContractId: string;
   private readonly reputationContractId: string;
 
@@ -99,7 +108,11 @@ export class IndexerProcessor extends WorkerHost {
     }
 
     const cursor = await this.getCursor(contractId);
-    const startLedger = cursor + 1;
+    let startLedger = cursor + 1;
+
+    // Proactive self-heal: fast-forward the cursor if it has fallen outside the
+    // RPC's event-retention window before we even ask for events.
+    startLedger = await this.healStaleCursor(contractId, startLedger, label);
 
     this.logger.debug({
         context: 'IndexerProcessor',
@@ -108,7 +121,17 @@ export class IndexerProcessor extends WorkerHost {
       startLedger,
     }, `Polling for ${label} events from ledger ${startLedger}`);
 
-    const rawEvents = await this.fetchEvents(contractId, startLedger);
+    let rawEvents: StellarSdk.SorobanRpc.Api.EventResponse[];
+    try {
+      rawEvents = await this.fetchEvents(contractId, startLedger);
+    } catch (error) {
+      // Reactive self-heal: the RPC rejected our startLedger as out of range.
+      // Correct the cursor from the range in the error and resume next cycle.
+      if (await this.recoverFromRangeError(contractId, error, label)) {
+        return;
+      }
+      throw error;
+    }
 
     if (rawEvents.length === 0) {
       this.logger.debug(`No new ${label} events found`);
@@ -390,6 +413,107 @@ export class IndexerProcessor extends WorkerHost {
         wallet: payload.wallet,
       }, 'Failed to update reputation cache — history was saved');
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // Self-healing cursor recovery
+  // -------------------------------------------------------------------------
+
+  /**
+   * Returns the current network ledger sequence from the configured Soroban RPC.
+   */
+  private async getLatestNetworkLedger(): Promise<number> {
+    const { sequence } = await this.sorobanService.getServer().getLatestLedger();
+    return sequence;
+  }
+
+  /**
+   * Proactively fast-forwards a stale cursor.
+   *
+   * A checkpoint that has fallen too far behind the network head would be
+   * rejected by the RPC, so we advance both the start ledger we return and the
+   * persisted cursor to a safe point just inside the retention window.
+   *
+   * @returns The ledger the caller should start fetching from.
+   */
+  private async healStaleCursor(
+    contractId: string,
+    startLedger: number,
+    label: string,
+  ): Promise<number> {
+    let latestLedger: number;
+    try {
+      latestLedger = await this.getLatestNetworkLedger();
+    } catch (error) {
+      // If we cannot read the network head, proceed with the existing cursor;
+      // the reactive handler will still catch an out-of-range failure.
+      this.logger.warn({
+        context: 'IndexerProcessor',
+        action: 'healStaleCursor',
+        error: error.message,
+        label,
+      }, 'Could not read latest network ledger — skipping proactive heal');
+      return startLedger;
+    }
+
+    const minValidLedger =
+      latestLedger - IndexerProcessor.LEDGER_RETENTION_BUFFER;
+
+    if (startLedger >= minValidLedger) {
+      return startLedger;
+    }
+
+    this.logger.warn({
+      context: 'IndexerProcessor',
+      action: 'healStaleCursor',
+      label,
+      startLedger,
+      minValidLedger,
+      latestLedger,
+    }, `Stale ledger checkpoint for ${label}: ${startLedger} is below minimum valid ${minValidLedger}. Fast-forwarding.`);
+
+    // Persist (minValidLedger - 1) so the next resume starts exactly at
+    // minValidLedger, matching the cursor+1 semantics used elsewhere.
+    await this.updateCursor(contractId, minValidLedger - 1);
+    return minValidLedger;
+  }
+
+  /**
+   * Reactively recovers from a "startLedger must be within the ledger range"
+   * RPC error by parsing the valid range and resetting the cursor to its lower
+   * bound.
+   *
+   * @returns `true` if the error was a recognised range error and the cursor was
+   *          corrected; `false` if the caller should rethrow.
+   */
+  private async recoverFromRangeError(
+    contractId: string,
+    error: unknown,
+    label: string,
+  ): Promise<boolean> {
+    const message = error instanceof Error ? error.message : String(error);
+
+    if (!message.includes('startLedger must be within')) {
+      return false;
+    }
+
+    const match = message.match(/(\d+)\s*-\s*(\d+)/);
+    if (!match) {
+      return false;
+    }
+
+    const minValidLedger = parseInt(match[1], 10);
+
+    this.logger.warn({
+      context: 'IndexerProcessor',
+      action: 'recoverFromRangeError',
+      label,
+      minValidLedger,
+    }, `Ledger out of range for ${label}. Auto-correcting cursor to ${minValidLedger}.`);
+
+    // Store (minValidLedger - 1) so the next cycle starts at minValidLedger.
+    await this.updateCursor(contractId, minValidLedger - 1);
+    return true;
   }
 
   // -------------------------------------------------------------------------
