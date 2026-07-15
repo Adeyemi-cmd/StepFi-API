@@ -2,6 +2,7 @@ import { MiddlewareConsumer, Module, NestModule } from '@nestjs/common';
 import { APP_GUARD, APP_FILTER } from '@nestjs/core';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
+import { ScheduleModule } from '@nestjs/schedule';
 import { BullModule } from '@nestjs/bullmq';
 import { SentryModule, SentryGlobalFilter } from '@sentry/nestjs/setup';
 import { AuthModule } from './modules/auth/auth.module';
@@ -33,6 +34,7 @@ import { CorrelationIdMiddleware } from './common/logger/correlation-id.middlewa
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
     SentryModule.forRoot(),
+    ScheduleModule.forRoot(),
     LoggerModule,
     ThrottlerModule.forRoot([
       {

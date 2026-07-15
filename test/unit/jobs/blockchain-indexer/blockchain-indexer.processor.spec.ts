@@ -1,6 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
-import { IndexerProcessor } from '../../../../src/indexer/indexer.processor';
+import { IndexerService } from '../../../../src/indexer/indexer.service';
 import { EventParserService } from '../../../../src/indexer/event-parser.service';
 import { SupabaseService } from '../../../../src/database/supabase.client';
 import { SorobanService } from '../../../../src/blockchain/soroban/soroban.service';
@@ -39,8 +39,8 @@ function createChain(overrides: Record<string, unknown> = {}) {
 // Tests
 // ---------------------------------------------------------------------------
 
-describe('IndexerProcessor', () => {
-  let processor: IndexerProcessor;
+describe('IndexerService', () => {
+  let processor: IndexerService;
   let eventParser: EventParserService;
 
   // Per-table chains so we can assert on the right table
@@ -92,7 +92,7 @@ describe('IndexerProcessor', () => {
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
       providers: [
-        IndexerProcessor,
+        IndexerService,
         EventParserService,
         { provide: SupabaseService, useValue: mockSupabaseService },
         { provide: SorobanService, useValue: mockSorobanService },
@@ -105,7 +105,7 @@ describe('IndexerProcessor', () => {
       ],
     }).compile();
 
-    processor = module.get(IndexerProcessor);
+    processor = module.get(IndexerService);
     eventParser = module.get(EventParserService);
 
     jest.clearAllMocks();
@@ -175,7 +175,7 @@ describe('IndexerProcessor', () => {
       });
       mockServer.getEvents.mockResolvedValue({ events: [], latestLedger: 100 });
 
-      await processor.process({} as any);
+      await processor.runIndexer();
 
       expect(mockServer.getEvents).toHaveBeenCalledTimes(2);
     });
@@ -189,13 +189,13 @@ describe('IndexerProcessor', () => {
         .mockRejectedValueOnce(new Error('Network error'))
         .mockResolvedValueOnce({ events: [], latestLedger: 100 });
 
-      await expect(processor.process({} as any)).resolves.not.toThrow();
+      await expect(processor.runIndexer()).resolves.not.toThrow();
     });
 
     it('should skip contracts with no configured ID', async () => {
       const module: TestingModule = await Test.createTestingModule({
         providers: [
-          IndexerProcessor,
+          IndexerService,
           EventParserService,
           { provide: SupabaseService, useValue: mockSupabaseService },
           { provide: SorobanService, useValue: mockSorobanService },
@@ -206,10 +206,10 @@ describe('IndexerProcessor', () => {
         ],
       }).compile();
 
-      const emptyProcessor = module.get(IndexerProcessor);
+      const emptyProcessor = module.get(IndexerService);
       mockServer.getEvents.mockClear();
 
-      await emptyProcessor.process({} as any);
+      await emptyProcessor.runIndexer();
 
       expect(mockServer.getEvents).not.toHaveBeenCalled();
     });
@@ -266,7 +266,7 @@ describe('IndexerProcessor', () => {
         error: { code: '23505', message: 'unique_violation' },
       });
 
-      await expect(processor.process({} as any)).resolves.not.toThrow();
+      await expect(processor.runIndexer()).resolves.not.toThrow();
     });
 
     it('should handle duplicate LOAN_REPAID events (23505)', async () => {
@@ -287,7 +287,7 @@ describe('IndexerProcessor', () => {
         error: { code: '23505', message: 'unique_violation' },
       });
 
-      await expect(processor.process({} as any)).resolves.not.toThrow();
+      await expect(processor.runIndexer()).resolves.not.toThrow();
     });
   });
 
@@ -334,7 +334,7 @@ describe('IndexerProcessor', () => {
       // Second call via update (LOAN_DEFAULTED) succeeds — but eq() needs to resolve
       loanChain.eq.mockResolvedValue({ error: null });
 
-      await expect(processor.process({} as any)).resolves.not.toThrow();
+      await expect(processor.runIndexer()).resolves.not.toThrow();
     });
   });
 
@@ -381,7 +381,7 @@ describe('IndexerProcessor', () => {
       reputationHistoryChain.insert.mockResolvedValue({ error: null });
       reputationCacheChain.eq.mockResolvedValue({ error: null });
 
-      await processor.process({} as any);
+      await processor.runIndexer();
 
       // Verify reputation_history insert
       expect(mockSupabaseClient.from).toHaveBeenCalledWith('reputation_history');
