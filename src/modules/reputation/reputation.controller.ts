@@ -32,7 +32,7 @@ export class ReputationController {
         type: ReputationResponseDto,
     })
     @ApiResponse({ status: 401, description: 'Unauthorized — missing or invalid JWT' })
-    async getMyScore(@Request() req: any) {
+    async getMyScore(@Request() req: { user?: { wallet?: string } }) {
         const wallet = req.user?.wallet;
         const data = await this.reputationService.getReputationScore(wallet);
 

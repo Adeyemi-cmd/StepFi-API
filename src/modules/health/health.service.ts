@@ -60,7 +60,7 @@ export class HealthService {
     }
   }
 
-  async checkHorizon(): Promise<{ status: string; [key: string]: any }> {
+  async checkHorizon(): Promise<{ status: string; [key: string]: unknown }> {
     try {
       const root = await this.fetchHorizonRoot();
       return {
@@ -75,7 +75,7 @@ export class HealthService {
     }
   }
 
-  async checkIndexerLag(): Promise<{ status: string; [key: string]: any }> {
+  async checkIndexerLag(): Promise<{ status: string; [key: string]: unknown }> {
     try {
       const cursor = await this.getIndexerCursor();
       const root = await this.fetchHorizonRoot();

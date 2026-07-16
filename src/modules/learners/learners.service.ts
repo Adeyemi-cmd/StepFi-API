@@ -1,7 +1,30 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { SupabaseService } from '../../database/supabase.client';
-import { UpdateLearnerProfileDto } from './dto/learner-profile.dto';
+import { UpdateLearnerProfileDto, CurrentRole, Skill, FinanceGoal, MonthlyIncomeRange } from './dto/learner-profile.dto';
 import { LearnerResponseDto } from './dto/learner-response.dto';
+
+/** Row shape of the learner_profiles table (snake_case columns). */
+interface LearnerProfileRow {
+  id: string;
+  wallet_address: string;
+  full_name: string | null;
+  bio: string | null;
+  country: string | null;
+  city: string | null;
+  current_role: CurrentRole | null;
+  institution: string | null;
+  program: string | null;
+  graduation_year: number | null;
+  skills: Skill[] | null;
+  finance_goals: FinanceGoal[] | null;
+  monthly_income_range: MonthlyIncomeRange | null;
+  github_url: string | null;
+  linkedin_url: string | null;
+  profile_complete: boolean;
+  onboarding_completed_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
 
 @Injectable()
 export class LearnersService {
@@ -76,7 +99,7 @@ export class LearnersService {
 
     const onboardingCompletedAt = isNewlyComplete ? new Date().toISOString() : existing?.onboarding_completed_at;
 
-    const updatePayload: any = {
+    const updatePayload: Record<string, unknown> = {
       wallet_address: wallet,
       profile_complete: isComplete,
       onboarding_completed_at: onboardingCompletedAt,
@@ -112,7 +135,7 @@ export class LearnersService {
     return this.mapToDto(data);
   }
 
-  private mapToDto(data: any): LearnerResponseDto {
+  private mapToDto(data: LearnerProfileRow): LearnerResponseDto {
     return {
       id: data.id,
       walletAddress: data.wallet_address,

@@ -205,7 +205,9 @@ export class TransactionStatusCheckerService {
           found: true,
           successful: response.successful === true,
           result: response,
-          errorMessage: this.extractHorizonError(response),
+          errorMessage: this.extractHorizonError(
+            response as { result_codes?: { transaction?: string } },
+          ),
         };
       } catch (error) {
         if (this.isNotFoundError(error)) {
@@ -235,7 +237,9 @@ export class TransactionStatusCheckerService {
     return { found: false };
   }
 
-  private extractHorizonError(response: any): string | undefined {
+  private extractHorizonError(
+    response: { result_codes?: { transaction?: string } } | null | undefined,
+  ): string | undefined {
     if (!response) {
       return undefined;
     }
@@ -261,12 +265,12 @@ export class TransactionStatusCheckerService {
       return true;
     }
 
-    const status = (error as any)?.response?.status;
+    const status = (error as { response?: { status?: number } })?.response?.status;
     if (status === 429 || status >= 500) {
       return true;
     }
 
-    const message = String((error as any)?.message ?? '').toLowerCase();
+    const message = String((error as { message?: string })?.message ?? '').toLowerCase();
     return (
       message.includes('timeout') ||
       message.includes('rate limit') ||
@@ -498,7 +502,15 @@ export class TransactionStatusCheckerService {
         return null;
       }
 
-      const invocation = (operation.func as any)?._value?._attributes;
+      // Reaches into the XDR object's internal structure (no public accessor).
+      const invocation = (operation.func as unknown as {
+        _value?: {
+          _attributes?: {
+            functionName?: { toString?: () => string };
+            args?: unknown[];
+          };
+        };
+      })?._value?._attributes;
       if (!invocation) {
         return null;
       }
@@ -511,7 +523,7 @@ export class TransactionStatusCheckerService {
 
       const nativeArgs = args.map((arg) => {
         try {
-          return StellarSdk.scValToNative(arg as any);
+          return StellarSdk.scValToNative(arg as StellarSdk.xdr.ScVal);
         } catch {
           return undefined;
         }

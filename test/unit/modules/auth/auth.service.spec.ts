@@ -309,7 +309,7 @@ describe('AuthService', () => {
       await service.generateTokens(validWallet);
 
       expect(mockJwtService.sign).toHaveBeenCalledWith(
-        { wallet: validWallet, type: 'access' },
+        { wallet: validWallet, type: 'access', role: null },
         expect.objectContaining({ expiresIn: '15m' }),
       );
     });
@@ -410,7 +410,7 @@ describe('AuthService', () => {
     });
 
     it('should register a new user successfully with profile image', async () => {
-      const mockFile = { buffer: Buffer.from('test'), mimetype: 'image/png' };
+      const mockFile = { originalname: 'avatar.png', buffer: Buffer.from('test'), mimetype: 'image/png' };
       const result = await service.register(registerDto, mockFile);
 
       expect(mockUsersRepository.uploadAvatar).toHaveBeenCalledWith(validWallet, mockFile);

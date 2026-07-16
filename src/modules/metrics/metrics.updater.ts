@@ -46,7 +46,7 @@ export class MetricsUpdater implements OnModuleInit {
       if (!response.ok) {
         throw new Error(`Horizon returned ${response.status}`);
       }
-      const root: any = await response.json();
+      const root = (await response.json()) as { history_latest_ledger?: number | string };
       const latestLedger = Number(root.history_latest_ledger);
       const lag = latestLedger - cursorLedger;
 

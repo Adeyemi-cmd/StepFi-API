@@ -20,6 +20,7 @@ import {
   ApiBearerAuth,
 } from '@nestjs/swagger';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
+import { Roles, RolesGuard } from '../../auth/guards/roles.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { VendorsService } from './vendors.service';
 import { VendorResponseDto, VendorType } from './dto/vendor.dto';
@@ -51,7 +52,8 @@ export class VendorsController {
   }
 
   @Post('api-keys')
-  @UseGuards(JwtAuthGuard)
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('vendor')
   @HttpCode(HttpStatus.CREATED)
   @ApiBearerAuth()
   @ApiOperation({ summary: 'Create a new API key for the authenticated vendor' })
@@ -66,7 +68,8 @@ export class VendorsController {
   }
 
   @Get('api-keys')
-  @UseGuards(JwtAuthGuard)
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('vendor')
   @HttpCode(HttpStatus.OK)
   @ApiBearerAuth()
   @ApiOperation({ summary: 'List all API keys for the authenticated vendor' })
@@ -80,7 +83,8 @@ export class VendorsController {
   }
 
   @Delete('api-keys/:id')
-  @UseGuards(JwtAuthGuard)
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('vendor')
   @HttpCode(HttpStatus.NO_CONTENT)
   @ApiBearerAuth()
   @ApiOperation({ summary: 'Revoke an API key' })
