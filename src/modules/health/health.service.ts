@@ -1,7 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { InjectQueue } from '@nestjs/bullmq';
-import { Queue } from 'bullmq';
 import { SupabaseService } from '../../database/supabase.client';
 
 interface HorizonRoot {
@@ -19,14 +17,6 @@ export class HealthService {
   constructor(
     private readonly configService: ConfigService,
     private readonly supabaseService: SupabaseService,
-    @InjectQueue('blockchain-indexer')
-    private readonly indexerQueue: Queue,
-    @InjectQueue('payment-reminders')
-    private readonly paymentRemindersQueue: Queue,
-    @InjectQueue('transaction-status-checker')
-    private readonly txStatusQueue: Queue,
-    @InjectQueue('nonce-cleanup')
-    private readonly nonceCleanupQueue: Queue,
   ) {
     this.horizonUrl =
       this.configService.get<string>('STELLAR_HORIZON_URL') ||
@@ -34,15 +24,13 @@ export class HealthService {
   }
 
   async check() {
-    const [db, horizon, indexer, bullmq, redis] = await Promise.all([
+    const [db, horizon, indexer] = await Promise.all([
       this.checkDatabase(),
       this.checkHorizon(),
       this.checkIndexerLag(),
-      this.checkBullMQ(),
-      this.checkRedis(),
     ]);
 
-    const allOk = [db, horizon, indexer, bullmq, redis].every(
+    const allOk = [db, horizon, indexer].every(
       (c) => c.status === 'ok',
     );
 
@@ -54,8 +42,6 @@ export class HealthService {
         database: db,
         horizon: horizon,
         indexer: indexer,
-        bullmq: bullmq,
-        redis: redis,
       },
     };
   }
@@ -99,38 +85,6 @@ export class HealthService {
       return { status, cursor, latestLedger, lag };
     } catch (error) {
       return { status: 'unknown', message: error.message };
-    }
-  }
-
-  async checkBullMQ() {
-    try {
-      const queues = [this.indexerQueue, this.paymentRemindersQueue, this.txStatusQueue, this.nonceCleanupQueue];
-      const results = await Promise.all(
-        queues.map(async (q) => {
-          const [waiting, active, delayed, failed] = await Promise.all([
-            q.getWaitingCount(),
-            q.getActiveCount(),
-            q.getDelayedCount(),
-            q.getFailedCount(),
-          ]);
-          return { queue: q.name, waiting, active, delayed, failed };
-        }),
-      );
-      const allHealthy = results.every((r) => r.active < 10 && r.failed < 100);
-      return { status: allHealthy ? 'ok' : 'warning', queues: results };
-    } catch (error) {
-      return { status: 'error', message: error.message };
-    }
-  }
-
-  async checkRedis() {
-    try {
-      const queue = this.indexerQueue;
-      const client = await queue.client;
-      const ping = await client.ping();
-      return { status: ping === 'PONG' ? 'ok' : 'error', message: 'Redis reachable' };
-    } catch (error) {
-      return { status: 'error', message: error.message };
     }
   }
 
