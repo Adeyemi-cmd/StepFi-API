@@ -56,7 +56,10 @@ describe('IndexerService', () => {
     getServiceRoleClient: jest.fn().mockReturnValue(mockSupabaseClient),
   };
 
-  const mockServer = { getEvents: jest.fn() };
+  const mockServer = {
+    getEvents: jest.fn(),
+    getLatestLedger: jest.fn().mockResolvedValue({ sequence: 100000 }),
+  };
   const mockSorobanService = {
     getServer: jest.fn().mockReturnValue(mockServer),
   };
