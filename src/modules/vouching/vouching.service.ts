@@ -3,6 +3,7 @@ import {
   Logger,
   NotFoundException,
   ConflictException,
+  ForbiddenException,
 } from '@nestjs/common';
 import { SupabaseService } from '../../database/supabase.client';
 import {
@@ -199,6 +200,65 @@ export class VouchingService {
     }
 
     return results;
+  }
+
+  /**
+   * Revokes a vouch. Only the mentor who created it may revoke it; ownership is
+   * verified before the write. The vouch is soft-revoked (status = REVOKED) so
+   * the record remains auditable, consistent with the existing status lifecycle.
+   *
+   * Note: no reputation adjustment is performed. Reputation scores in StepFi are
+   * sourced read-only from the on-chain reputation contract (Redis -> Supabase
+   * cache -> blockchain); vouch approval applies no server-side reputation
+   * boost, so there is no delta to reverse here. If an on-chain reputation
+   * boost is ever wired into approval, its reversal belongs at that same layer.
+   */
+  async revokeVouch(mentorWallet: string, vouchId: string): Promise<VouchResponseDto> {
+    const client = this.supabaseService.getServiceRoleClient();
+
+    const { data: existing, error: findError } = await client
+      .from('vouches')
+      .select('*')
+      .eq('id', vouchId)
+      .maybeSingle();
+
+    if (findError) {
+      this.logger.error(`Failed to load vouch ${vouchId}: ${findError.message}`);
+      throw new Error('Failed to load vouch.');
+    }
+
+    if (!existing) {
+      throw new NotFoundException({
+        code: 'VOUCH_NOT_FOUND',
+        message: 'Vouch not found.',
+      });
+    }
+
+    const existingRow = existing as VouchRow;
+    if (existingRow.mentor_wallet !== mentorWallet) {
+      throw new ForbiddenException({
+        code: 'VOUCH_FORBIDDEN',
+        message: 'You can only revoke vouches you created.',
+      });
+    }
+
+    const { data, error } = await client
+      .from('vouches')
+      .update({
+        status: VouchStatus.REVOKED,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', vouchId)
+      .select()
+      .single();
+
+    if (error || !data) {
+      this.logger.error(`Failed to revoke vouch ${vouchId}: ${error?.message}`);
+      throw new Error('Failed to revoke vouch.');
+    }
+
+    this.logger.log(`Vouch revoked: id=${vouchId} mentor=${mentorWallet}`);
+    return this.mapToDto(data as VouchRow);
   }
 
   private async getLearnerReputationScore(wallet: string): Promise<number> {

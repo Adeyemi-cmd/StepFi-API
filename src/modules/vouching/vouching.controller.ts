@@ -2,7 +2,10 @@ import {
   Controller,
   Post,
   Get,
+  Delete,
+  Param,
   Body,
+  ParseUUIDPipe,
   UseGuards,
   HttpCode,
   HttpStatus,
@@ -11,6 +14,7 @@ import {
   ApiTags,
   ApiOperation,
   ApiResponse,
+  ApiParam,
   ApiBearerAuth,
 } from '@nestjs/swagger';
 import { VouchingService } from './vouching.service';
@@ -89,5 +93,21 @@ export class VouchingController {
     @CurrentUser() user: { wallet: string },
   ): Promise<VouchRequestItemDto[]> {
     return this.vouchingService.getIncomingRequests(user.wallet);
+  }
+
+  @Delete(':id')
+  @UseGuards(RolesGuard)
+  @Roles('mentor')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Mentor revokes a vouch they created' })
+  @ApiParam({ name: 'id', description: 'Vouch UUID' })
+  @ApiResponse({ status: 200, description: 'Vouch revoked', type: VouchResponseDto })
+  @ApiResponse({ status: 403, description: 'Not the mentor who created this vouch' })
+  @ApiResponse({ status: 404, description: 'Vouch not found' })
+  async revokeVouch(
+    @CurrentUser() user: { wallet: string },
+    @Param('id', ParseUUIDPipe) vouchId: string,
+  ): Promise<VouchResponseDto> {
+    return this.vouchingService.revokeVouch(user.wallet, vouchId);
   }
 }
