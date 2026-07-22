@@ -16,6 +16,15 @@ pure chore/docs commits). Direct pushes to main must also be logged here.
 - Updated existing `test/e2e/modules/liquidity/liquidity-flow.e2e-spec.ts` to mock the new `LiquidityContractClient` structure.
 - Updated `test/unit/modules/liquidity/liquidity.service.spec.ts` unit tests.
 
+## 2026-07-18
+
+- Added scheduled state reconciliation across indexed on-chain loan,
+  liquidity, reputation, and transaction state. The idempotent Cron job
+  resolves provisional loan IDs, repairs stale database state, backfills
+  missed transaction records, marks orphaned pending transactions, exports
+  drift metrics, and logs a structured report without making on-chain writes.
+  Cron is used instead of BullMQ per the API's post-Upstash architecture.
+
 ## 2026-07-16
 
 - Added wallet-bound user roles (sponsor/vendor/mentor): `role` column
