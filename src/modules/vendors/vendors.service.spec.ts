@@ -1,13 +1,12 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { ConflictException, NotFoundException, ForbiddenException, UnauthorizedException, ExecutionContext } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { VendorsService } from '../../../../src/modules/vendors/vendors.service';
-import { VendorsController } from '../../../../src/modules/vendors/vendors.controller';
-import { SupabaseService } from '../../../../src/database/supabase.client';
-import { VendorRegistryContractClient } from '../../../../src/stellar/contracts/clients/vendor-registry.client';
-import { VendorType, VendorStatus } from '../../../../src/modules/vendors/dto/vendor.dto';
-import { VendorsRepository } from '../../../../src/database/repositories/vendors.repository';
-import { AdminGuard } from '../../../../src/common/guards/admin.guard';
+import { VendorsService } from './vendors.service';
+import { VendorsController } from './vendors.controller';
+import { SupabaseService } from '../../database/supabase.client';
+import { VendorRegistryContractClient } from '../../stellar/contracts/clients/vendor-registry.client';
+import { VendorType, VendorStatus } from './dto/vendor.dto';
+import { AdminGuard } from '../../common/guards/admin.guard';
 
 describe('VendorsModule', () => {
   let service: VendorsService;
@@ -38,6 +37,11 @@ describe('VendorsModule', () => {
     ...pendingVendorRow,
     status: VendorStatus.APPROVED,
     verified: true,
+  };
+
+  const suspendedVendorRow = {
+    ...pendingVendorRow,
+    status: VendorStatus.SUSPENDED,
   };
 
   beforeEach(async () => {
@@ -81,7 +85,6 @@ describe('VendorsModule', () => {
         VendorsService,
         AdminGuard,
         { provide: SupabaseService, useValue: mockSupabaseService },
-        { provide: VendorsRepository, useValue: { findByWallet: jest.fn() } },
         { provide: VendorRegistryContractClient, useValue: mockVendorRegistryClient },
         { provide: ConfigService, useValue: mockConfigService },
       ],
@@ -145,6 +148,7 @@ describe('VendorsModule', () => {
       expect(result.vendorId).toBe(mockVendorId);
       expect(result.status).toBe(VendorStatus.PENDING);
       expect(mockVendorRegistryClient.buildApproveVendorXdr).toHaveBeenCalledWith(mockAdminWallet, mockVendorId);
+      // Database write must NOT be triggered on XDR build
       expect(qb.update).not.toHaveBeenCalled();
     });
 
@@ -168,6 +172,7 @@ describe('VendorsModule', () => {
       expect(result.vendorId).toBe(mockVendorId);
       expect(result.status).toBe(VendorStatus.APPROVED);
       expect(mockVendorRegistryClient.buildSuspendVendorXdr).toHaveBeenCalledWith(mockAdminWallet, mockVendorId);
+      // Database write must NOT be triggered on XDR build
       expect(qb.update).not.toHaveBeenCalled();
     });
 

@@ -1,15 +1,21 @@
 import {
-  ConflictException,
-  ForbiddenException,
   Injectable,
-  InternalServerErrorException,
   Logger,
   NotFoundException,
+  ConflictException,
+  ForbiddenException,
+  InternalServerErrorException,
 } from '@nestjs/common';
 import { createHash, randomBytes } from 'crypto';
 import { SupabaseService } from '../../database/supabase.client';
 import { VendorsRepository, VendorDetailRecord } from '../../database/repositories/vendors.repository';
-import { VendorResponseDto, VendorType } from './dto/vendor.dto';
+import { VendorRegistryContractClient } from '../../stellar/contracts/clients/vendor-registry.client';
+import {
+  VendorResponseDto,
+  VendorType,
+  VendorStatus,
+  VendorActionResponseDto,
+} from './dto/vendor.dto';
 import { RegisterVendorDto } from './dto/register-vendor.dto';
 import { VendorDashboardDto } from './dto/vendor-dashboard.dto';
 import { VendorLoanDto, VendorLoansPageDto } from './dto/vendor-loan.dto';
@@ -68,6 +74,7 @@ interface VendorRow {
   wallet_address: string;
   name: string;
   type: VendorType;
+  status: VendorStatus;
   verified: boolean;
   website: string | null;
   country: string | null;
@@ -97,17 +104,18 @@ export class VendorsService {
   constructor(
     private readonly supabaseService: SupabaseService,
     private readonly vendorsRepository: VendorsRepository,
+    private readonly vendorRegistryClient: VendorRegistryContractClient,
   ) {}
 
   async getAll(type?: VendorType): Promise<VendorResponseDto[]> {
     const client = this.supabaseService.getClient();
-    let query = client.from('vendors').select('*').order('created_at', { ascending: false });
+    let query = client.from('vendors').select('*');
 
     if (type) {
       query = query.eq('type', type);
     }
 
-    const { data, error } = await query;
+    const { data, error } = await query.order('created_at', { ascending: false });
 
     if (error) {
       this.logger.error(`Failed to list vendors: ${error.message}`);
@@ -119,6 +127,51 @@ export class VendorsService {
   }
 
   async getById(id: string): Promise<VendorResponseDto> {
+    const data = await this.getRawById(id);
+    return this.mapToDto(data);
+  }
+
+  async approveVendor(adminWallet: string, id: string): Promise<VendorActionResponseDto> {
+    const vendor = await this.getRawById(id);
+
+    if (vendor.status !== VendorStatus.PENDING) {
+      throw new ConflictException({
+        code: 'VENDOR_NOT_PENDING',
+        message: `Cannot approve vendor in '${vendor.status}' status. Vendor must be in pending status.`,
+      });
+    }
+
+    const unsignedXdr = await this.vendorRegistryClient.buildApproveVendorXdr(adminWallet, vendor.id);
+
+    return {
+      unsignedXdr,
+      description: `Approve vendor '${vendor.name}' on-chain`,
+      vendorId: vendor.id,
+      status: vendor.status,
+    };
+  }
+
+  async suspendVendor(adminWallet: string, id: string): Promise<VendorActionResponseDto> {
+    const vendor = await this.getRawById(id);
+
+    if (vendor.status !== VendorStatus.APPROVED) {
+      throw new ConflictException({
+        code: 'VENDOR_NOT_APPROVED',
+        message: `Cannot suspend vendor in '${vendor.status}' status. Vendor must be in approved status.`,
+      });
+    }
+
+    const unsignedXdr = await this.vendorRegistryClient.buildSuspendVendorXdr(adminWallet, vendor.id);
+
+    return {
+      unsignedXdr,
+      description: `Suspend vendor '${vendor.name}' on-chain`,
+      vendorId: vendor.id,
+      status: vendor.status,
+    };
+  }
+
+  private async getRawById(id: string): Promise<VendorRow> {
     const client = this.supabaseService.getClient();
 
     const { data, error } = await client
@@ -134,7 +187,7 @@ export class VendorsService {
       });
     }
 
-    return this.mapToDto(data as VendorRow);
+    return data as VendorRow;
   }
 
   /**
@@ -620,6 +673,7 @@ export class VendorsService {
       walletAddress: data.wallet_address,
       name: data.name,
       type: data.type,
+      status: data.status ?? VendorStatus.PENDING,
       verified: data.verified,
       website: data.website ?? undefined,
       country: data.country ?? undefined,
@@ -644,3 +698,4 @@ export class VendorsService {
     };
   }
 }
+

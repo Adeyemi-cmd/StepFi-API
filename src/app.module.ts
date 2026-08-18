@@ -1,5 +1,5 @@
 import { MiddlewareConsumer, Module, NestModule, OnModuleInit } from '@nestjs/common';
-import { APP_GUARD, APP_FILTER } from '@nestjs/core';
+import { APP_GUARD, APP_FILTER, APP_INTERCEPTOR } from '@nestjs/core';
 import { ConfigModule } from '@nestjs/config';
 import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
 import { ScheduleModule } from '@nestjs/schedule';
@@ -30,6 +30,7 @@ import { AdminModule } from './modules/admin/admin.module';
 import { CorrelationIdMiddleware } from './common/logger/correlation-id.middleware';
 import { StateReconciliationModule } from './jobs/state-reconciliation/state-reconciliation.module';
 import { validateAdminWallets } from './config/env';
+import { AuditInterceptor } from './common/interceptors/audit.interceptor';
 
 @Module({
   imports: [
@@ -76,6 +77,10 @@ import { validateAdminWallets } from './config/env';
     {
       provide: APP_FILTER,
       useClass: SentryGlobalFilter,
+    },
+    {
+      provide: APP_INTERCEPTOR,
+      useClass: AuditInterceptor,
     },
   ],
 })
