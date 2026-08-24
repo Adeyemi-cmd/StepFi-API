@@ -21,6 +21,7 @@ import { IndexerModule } from './indexer/indexer.module';
 import { LoanPaymentReminderModule } from './jobs/loan-payment-reminder/loan-payment-reminder.module';
 import { TransactionStatusCheckerModule } from './jobs/transaction-status-checker/transaction-status-checker.module';
 import { NonceCleanupModule } from './jobs/nonce-cleanup/nonce-cleanup.module';
+import { SessionCleanupModule } from './jobs/session-cleanup/session-cleanup.module';
 import { SupabaseKeepAliveModule } from './jobs/supabase-keepalive/supabase-keepalive.module';
 import { StellarModule } from './stellar/stellar.module';
 import { LoggerModule } from './common/logger/logger.module';
@@ -62,6 +63,7 @@ import { AuditInterceptor } from './common/interceptors/audit.interceptor';
     LoanPaymentReminderModule,
     TransactionStatusCheckerModule,
     NonceCleanupModule,
+    SessionCleanupModule,
     SupabaseKeepAliveModule,
     StateReconciliationModule,
     CreditScoringModule,

@@ -2,9 +2,11 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { InternalServerErrorException, ConflictException, UnauthorizedException } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
+import { createHash } from 'crypto';
 import { AuthService } from '../../../../src/modules/auth/auth.service';
 import { SupabaseService } from '../../../../src/database/supabase.client';
 import { UsersRepository } from '../../../../src/database/repositories/users.repository';
+import { AuditService } from '../../../../src/modules/admin/audit.service';
 
 // Mock Stellar SDK to avoid real crypto operations in unit tests
 jest.mock('stellar-sdk', () => ({
@@ -26,8 +28,9 @@ describe('AuthService', () => {
     getServiceRoleClient: jest.fn(() => mockSupabaseClient),
   };
 
-  const mockJwtService = {
+  const mockJwtService: { sign: jest.Mock; verify: jest.Mock } = {
     sign: jest.fn().mockReturnValue('mock.jwt.token'),
+    verify: jest.fn(),
   };
 
   const mockConfigService = {
@@ -41,6 +44,11 @@ describe('AuthService', () => {
     createProfile: jest.fn(),
   };
 
+  const mockAuditService = {
+    log: jest.fn().mockResolvedValue(undefined),
+    logWithBeforeAfter: jest.fn().mockResolvedValue(undefined),
+  };
+
   const validWallet = 'GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW';
 
   beforeEach(async () => {
@@ -51,6 +59,7 @@ describe('AuthService', () => {
         { provide: JwtService, useValue: mockJwtService },
         { provide: ConfigService, useValue: mockConfigService },
         { provide: UsersRepository, useValue: mockUsersRepository },
+        { provide: AuditService, useValue: mockAuditService },
       ],
     }).compile();
 
@@ -351,13 +360,51 @@ describe('AuthService', () => {
       );
     });
 
-    it('should sign refresh token with payload { wallet, type: refresh } and 7d expiration', async () => {
+    it('should sign refresh token with payload { wallet, type: refresh, fam } and 7d expiration', async () => {
       setupMocks();
       await service.generateTokens(validWallet);
 
       expect(mockJwtService.sign).toHaveBeenCalledWith(
-        { wallet: validWallet, type: 'refresh' },
+        { wallet: validWallet, type: 'refresh', fam: expect.any(String) },
         expect.objectContaining({ expiresIn: '7d' }),
+      );
+    });
+
+    it('should store session row with the same family_id embedded in the refresh token', async () => {
+      const sessionInsert = jest.fn().mockResolvedValue({ error: null });
+      mockFrom.mockImplementation((table: string) => {
+        if (table === 'users') {
+          const chain: Record<string, jest.Mock> = {
+            upsert: jest.fn(),
+            select: jest.fn(),
+            single: jest.fn().mockResolvedValue({ data: { id: 'user-uuid', status: 'active' }, error: null }),
+          };
+          chain.upsert.mockReturnValue(chain);
+          chain.select.mockReturnValue(chain);
+          return chain;
+        }
+        if (table === 'learner_profiles') {
+          const chain: Record<string, jest.Mock> = {
+            select: jest.fn(),
+            eq: jest.fn(),
+            maybeSingle: jest.fn().mockResolvedValue({ data: null, error: null }),
+            insert: jest.fn().mockResolvedValue({ error: null }),
+          };
+          chain.select.mockReturnValue(chain);
+          chain.eq.mockReturnValue(chain);
+          return chain;
+        }
+        if (table === 'sessions') {
+          return { insert: sessionInsert };
+        }
+        return { insert: mockInsert };
+      });
+
+      await service.generateTokens(validWallet);
+
+      const refreshCall = mockJwtService.sign.mock.calls.find((c) => c[0].type === 'refresh');
+      expect(sessionInsert).toHaveBeenCalledWith(
+        expect.objectContaining({ family_id: refreshCall?.[0].fam }),
       );
     });
 
@@ -485,6 +532,149 @@ describe('AuthService', () => {
       await expect(service.register(registerDto)).rejects.toThrow(ConflictException);
       await expect(service.register(registerDto)).rejects.toMatchObject({
         response: { code: 'AUTH_USERNAME_TAKEN' },
+      });
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // refreshTokens — rotation within session family + replay detection
+  // ---------------------------------------------------------------------------
+  describe('refreshTokens', () => {
+    const refreshToken = 'valid.refresh.token';
+    const tokenHash = createHash('sha256').update(refreshToken).digest('hex');
+    const familyId = '11111111-2222-3333-4444-555555555555';
+    const futureExpiry = new Date(Date.now() + 60 * 1000).toISOString();
+
+    function setupSessionMocks({
+      payload = { wallet: validWallet, type: 'refresh', fam: familyId } as Record<string, string>,
+      sessionLookup = { data: { id: 'session-uuid', family_id: familyId, expires_at: futureExpiry }, error: null },
+      userStatus = 'active',
+    } = {}) {
+      const deleteEq = jest.fn().mockResolvedValue({ error: null, count: 1 });
+      const deleteFn = jest.fn().mockReturnValue({ eq: deleteEq });
+      mockJwtService.verify.mockReturnValue(payload);
+      mockFrom.mockImplementation((table: string) => {
+        if (table === 'users') {
+          const chain: Record<string, jest.Mock> = {
+            upsert: jest.fn(),
+            select: jest.fn(),
+            single: jest.fn().mockResolvedValue({ data: { id: 'user-uuid', status: userStatus }, error: null }),
+          };
+          chain.upsert.mockReturnValue(chain);
+          chain.select.mockReturnValue(chain);
+          return chain;
+        }
+        if (table === 'learner_profiles') {
+          const chain: Record<string, jest.Mock> = {
+            select: jest.fn(),
+            eq: jest.fn(),
+            maybeSingle: jest.fn().mockResolvedValue({ data: null, error: null }),
+            insert: jest.fn().mockResolvedValue({ error: null }),
+          };
+          chain.select.mockReturnValue(chain);
+          chain.eq.mockReturnValue(chain);
+          return chain;
+        }
+        if (table === 'sessions') {
+          return {
+            select: jest.fn().mockReturnThis(),
+            eq: jest.fn().mockReturnThis(),
+            single: jest.fn().mockResolvedValue(sessionLookup),
+            insert: jest.fn().mockResolvedValue({ error: null }),
+            delete: deleteFn,
+          };
+        }
+        return { insert: mockInsert };
+      });
+      return { deleteFn, deleteEq };
+    }
+
+    beforeEach(() => {
+      mockConfigService.get.mockImplementation((key: string) =>
+        key === 'JWT_REFRESH_SECRET' ? 'refresh-secret' : 'mock-secret',
+      );
+      mockJwtService.verify.mockReturnValue({ wallet: validWallet, type: 'refresh', fam: familyId });
+    });
+
+    it('should rotate tokens into the same session family', async () => {
+      setupSessionMocks();
+
+      await service.refreshTokens(refreshToken);
+
+      const refreshCall = mockJwtService.sign.mock.calls.find((c) => c[0].type === 'refresh');
+      expect(refreshCall?.[0]).toMatchObject({ wallet: validWallet, fam: familyId });
+    });
+
+    it('should delete the presented session row on successful rotation', async () => {
+      const { deleteEq } = setupSessionMocks();
+
+      await service.refreshTokens(refreshToken);
+
+      expect(deleteEq).toHaveBeenCalledWith('id', 'session-uuid');
+    });
+
+    it('should revoke the entire family and write an audit event when a rotated token is replayed', async () => {
+      // Session row is gone — the token was already rotated.
+      const { deleteFn } = setupSessionMocks({
+        sessionLookup: { data: null, error: { message: 'No rows found' } },
+      });
+
+      await expect(service.refreshTokens(refreshToken)).rejects.toMatchObject({
+        response: { code: 'AUTH_REFRESH_TOKEN_REUSED' },
+      });
+
+      expect(deleteFn).toHaveBeenCalledWith({ count: 'exact' });
+      expect(mockAuditService.logWithBeforeAfter).toHaveBeenCalledWith(
+        expect.objectContaining({
+          actorWallet: validWallet,
+          action: 'auth.refresh_token_reuse',
+          resource: 'session',
+          metadata: { family_id: familyId },
+        }),
+      );
+    });
+
+    it('should throw AUTH_SESSION_NOT_FOUND for an unknown legacy token without a family claim', async () => {
+      setupSessionMocks({
+        payload: { wallet: validWallet, type: 'refresh' },
+        sessionLookup: { data: null, error: { message: 'No rows found' } },
+      });
+
+      await expect(service.refreshTokens(refreshToken)).rejects.toMatchObject({
+        response: { code: 'AUTH_SESSION_NOT_FOUND' },
+      });
+      // No family claim → nothing to revoke, no audit event for the family.
+      expect(mockAuditService.logWithBeforeAfter).not.toHaveBeenCalled();
+    });
+
+    it('should throw AUTH_SESSION_EXPIRED when the session row exists but has expired', async () => {
+      setupSessionMocks({
+        sessionLookup: {
+          data: { id: 'session-uuid', family_id: familyId, expires_at: new Date(Date.now() - 1000).toISOString() },
+          error: null,
+        },
+      });
+
+      await expect(service.refreshTokens(refreshToken)).rejects.toMatchObject({
+        response: { code: 'AUTH_SESSION_EXPIRED' },
+      });
+    });
+
+    it('should throw AUTH_USER_BLOCKED when refreshing for a blocked user', async () => {
+      setupSessionMocks({ userStatus: 'blocked' });
+
+      await expect(service.refreshTokens(refreshToken)).rejects.toMatchObject({
+        response: { code: 'AUTH_USER_BLOCKED' },
+      });
+    });
+
+    it('should throw AUTH_REFRESH_TOKEN_INVALID when JWT verification fails', async () => {
+      mockJwtService.verify.mockImplementation(() => {
+        throw new Error('jwt expired');
+      });
+
+      await expect(service.refreshTokens('garbage')).rejects.toMatchObject({
+        response: { code: 'AUTH_REFRESH_TOKEN_INVALID' },
       });
     });
   });

@@ -6,6 +6,27 @@ pure chore/docs commits). Direct pushes to main must also be logged here.
 
 ---
 
+## 2026-08-24
+
+- **Session families + refresh-token replay detection** (`sessions.family_id`
+  migration, `fam` claim in refresh JWTs). Replaying an already-rotated
+  refresh token now revokes every session in the family and writes a
+  `auth.refresh_token_reuse` audit log entry — previously the first
+  presenter of a stolen token won silently. Legacy tokens without a `fam`
+  claim keep the old `AUTH_SESSION_NOT_FOUND` response.
+- **Blocked-user enforcement on every request**: new
+  `UserStatusService` (in-memory TTL cache) consulted by `JwtStrategy`.
+  Documented staleness bound: **30 seconds** — a blocked wallet loses API
+  access within ~30s of being blocked instead of retaining access until its
+  access token expires (up to 15 minutes). Cache is per-instance and fails
+  open on DB errors to avoid locking out all users during a DB blip.
+- **Session cleanup cron** (`src/jobs/session-cleanup/`, hourly,
+  mirrors nonce-cleanup): deletes only rows with `expires_at` older than
+  1 hour; sessions no longer accumulate forever.
+- Tests: refresh-family rotation, replay → family-wide revocation + audit
+  event, blocked-user denial within TTL bound, cache expiry re-query,
+  cleanup job deletes-only-expired.
+
 ## 2026-07-23
 
 - Added GitHub Actions health check workflow (`health-check.yml`) to ping the Render API every 6 hours to prevent the free tier instance from sleeping. Auto-creates or comments on issues with the `incident` label if the ping fails, preventing silent outages.
