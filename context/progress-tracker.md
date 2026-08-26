@@ -33,7 +33,6 @@ pure chore/docs commits). Direct pushes to main must also be logged here.
 - Added idempotent migration `20260826130000_ensure_users_unique_constraints.sql` to ensure unique indexes exist on `users.wallet_address` and `users.username`.
 - Updated `UsersRepository.createProfile()` to catch PostgreSQL unique constraint violation error `23505` and map to structured 409 `ConflictException` (`AUTH_WALLET_EXISTS`, `AUTH_USERNAME_TAKEN`).
 - Added cleanup handlers (`deleteAvatar`, `deleteUserById`) in `AuthService.register()` and `UsersRepository` to ensure failed registrations do not leave orphaned avatar files or partial user records.
-- Added unit tests covering DB unique constraint error mapping, parallel race conditions for duplicate wallet and username registrations, sequential re-registration compatibility, and avatar/user cleanup on failure.
 
 ## 2026-07-23
 
