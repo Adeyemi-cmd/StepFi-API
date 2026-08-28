@@ -5,7 +5,10 @@ import {
   ConflictException,
   ForbiddenException,
   InternalServerErrorException,
+  Inject,
 } from '@nestjs/common';
+import { CACHE_MANAGER } from '@nestjs/cache-manager';
+import { Cache } from 'cache-manager';
 import { createHash, randomBytes } from 'crypto';
 import { SupabaseService } from '../../database/supabase.client';
 import { VendorsRepository, VendorDetailRecord } from '../../database/repositories/vendors.repository';
@@ -105,6 +108,7 @@ export class VendorsService {
     private readonly supabaseService: SupabaseService,
     private readonly vendorsRepository: VendorsRepository,
     private readonly vendorRegistryClient: VendorRegistryContractClient,
+    @Inject(CACHE_MANAGER) private readonly cacheManager: Cache,
   ) {}
 
   async getAll(type?: VendorType): Promise<VendorResponseDto[]> {
@@ -641,7 +645,7 @@ export class VendorsService {
     const client = this.supabaseService.getServiceRoleClient();
     const { data: existing, error: fetchError } = await client
       .from('api_keys')
-      .select('id')
+      .select('id, key_hash')
       .eq('id', keyId)
       .eq('vendor_id', vendor.id)
       .single();
@@ -664,6 +668,21 @@ export class VendorsService {
         code: 'DATABASE_API_KEY_REVOKE_FAILED',
         message: 'Failed to revoke API key.',
       });
+    }
+
+    // Invalidate cached key record so the next request hits the DB and
+    // observes is_active = false within one TTL. Never store full keys;
+    // cache is keyed by hash.
+    try {
+      const row = existing as unknown as { key_hash: string };
+      const keyHash = row.key_hash;
+      if (keyHash) {
+        await this.cacheManager.del(`apikey:record:${keyHash}`);
+      }
+      await this.cacheManager.del(`apikey:rate:${keyId}`);
+      await this.cacheManager.del(`apikey:last_used:${keyId}`);
+    } catch (error) {
+      this.logger.warn(`Failed to invalidate API key cache for ${keyId}: ${(error as Error).message}`);
     }
   }
 

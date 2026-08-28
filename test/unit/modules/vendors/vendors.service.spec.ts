@@ -1,4 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
+import { CACHE_MANAGER } from '@nestjs/cache-manager';
 import { ConflictException, NotFoundException, ForbiddenException, UnauthorizedException, ExecutionContext } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { VendorsService } from '../../../../src/modules/vendors/vendors.service';
@@ -42,6 +43,7 @@ describe('VendorsModule', () => {
     verified: true,
   };
 
+  let mockCacheManager: { get: jest.Mock; set: jest.Mock; del: jest.Mock };
   beforeEach(async () => {
     const mockQueryBuilder = {
       select: jest.fn().mockReturnThis(),
@@ -49,6 +51,9 @@ describe('VendorsModule', () => {
       order: jest.fn().mockReturnThis(),
       single: jest.fn(),
       update: jest.fn().mockReturnThis(),
+      delete: jest.fn().mockReturnThis(),
+      in: jest.fn().mockReturnThis(),
+      range: jest.fn().mockReturnThis(),
     };
 
     mockSupabaseService = {
@@ -77,6 +82,12 @@ describe('VendorsModule', () => {
       }),
     };
 
+    mockCacheManager = {
+      get: jest.fn().mockResolvedValue(undefined),
+      set: jest.fn().mockResolvedValue(undefined),
+      del: jest.fn().mockResolvedValue(undefined),
+    };
+
     const module: TestingModule = await Test.createTestingModule({
       controllers: [VendorsController],
       providers: [
@@ -88,6 +99,7 @@ describe('VendorsModule', () => {
         { provide: VendorsRepository, useValue: { findByWallet: jest.fn() } },
         { provide: VendorRegistryContractClient, useValue: mockVendorRegistryClient },
         { provide: ConfigService, useValue: mockConfigService },
+        { provide: CACHE_MANAGER, useValue: mockCacheManager },
       ],
     }).compile();
 
@@ -228,6 +240,80 @@ describe('VendorsModule', () => {
     it('should throw UnauthorizedException (401) when user is unauthenticated', () => {
       const ctx = createMockContext(undefined);
       expect(() => adminGuard.canActivate(ctx)).toThrow(UnauthorizedException);
+    });
+  });
+
+  describe('VendorsService.revokeApiKey — cache invalidation', () => {
+    const mockVendor = { id: mockVendorId, wallet_address: 'GAVENDOR' } as unknown as ReturnType<VendorsRepository['findByWallet']> extends Promise<infer T> ? T : never;
+    const mockKeyHash = 'abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890';
+
+    it('should invalidate cached key record and rate/last_used keys on revocation', async () => {
+      const vendorsRepo = (service as unknown as { vendorsRepository: VendorsRepository }).vendorsRepository as unknown as { findByWallet: jest.Mock };
+      vendorsRepo.findByWallet.mockResolvedValue(mockVendor);
+
+      const qb = mockSupabaseService._queryBuilder;
+      qb.single
+        .mockResolvedValueOnce({ data: { id: 'key-id', key_hash: mockKeyHash }, error: null }) // fetch existing
+        .mockResolvedValueOnce({ data: null, error: null }); // not used
+
+      // mock update chain
+      qb.update.mockReturnValue({
+        eq: jest.fn().mockReturnValue({
+          eq: jest.fn().mockResolvedValue({ error: null }),
+        }),
+      } as unknown as ReturnType<typeof qb.update>);
+      // Actually our service does: .update({is_active:false}).eq('id', keyId) — single eq
+      const mockUpdateSingleEq = jest.fn().mockResolvedValue({ error: null });
+      mockSupabaseService.getServiceRoleClient.mockReturnValue({
+        from: jest.fn().mockImplementation((table: string) => {
+          if (table === 'api_keys') {
+            return {
+              select: jest.fn().mockReturnValue({
+                eq: jest.fn().mockReturnValue({
+                  eq: jest.fn().mockReturnValue({
+                    single: jest.fn().mockResolvedValue({ data: { id: 'key-id', key_hash: mockKeyHash }, error: null }),
+                  }),
+                }),
+              }),
+              update: jest.fn().mockReturnValue({ eq: mockUpdateSingleEq }),
+            };
+          }
+          return { select: jest.fn() } as unknown as ReturnType<typeof mockSupabaseService.getServiceRoleClient>['from'];
+        }),
+      } as unknown as typeof mockSupabaseService.getServiceRoleClient extends () => infer R ? R : never);
+
+      await service.revokeApiKey('GAVENDOR', 'key-id');
+
+      expect(mockCacheManager.del).toHaveBeenCalledWith(`apikey:record:${mockKeyHash}`);
+      expect(mockCacheManager.del).toHaveBeenCalledWith(`apikey:rate:key-id`);
+      expect(mockCacheManager.del).toHaveBeenCalledWith(`apikey:last_used:key-id`);
+    });
+
+    it('should not throw when cache invalidation fails', async () => {
+      const vendorsRepo = (service as unknown as { vendorsRepository: VendorsRepository }).vendorsRepository as unknown as { findByWallet: jest.Mock };
+      vendorsRepo.findByWallet.mockResolvedValue(mockVendor);
+
+      mockCacheManager.del.mockRejectedValueOnce(new Error('Redis down'));
+
+      mockSupabaseService.getServiceRoleClient.mockReturnValue({
+        from: jest.fn().mockImplementation((table: string) => {
+          if (table === 'api_keys') {
+            return {
+              select: jest.fn().mockReturnValue({
+                eq: jest.fn().mockReturnValue({
+                  eq: jest.fn().mockReturnValue({
+                    single: jest.fn().mockResolvedValue({ data: { id: 'key-id', key_hash: mockKeyHash }, error: null }),
+                  }),
+                }),
+              }),
+              update: jest.fn().mockReturnValue({ eq: jest.fn().mockResolvedValue({ error: null }) }),
+            };
+          }
+          return { select: jest.fn() } as never;
+        }),
+      } as never);
+
+      await expect(service.revokeApiKey('GAVENDOR', 'key-id')).resolves.toBeUndefined();
     });
   });
 });
