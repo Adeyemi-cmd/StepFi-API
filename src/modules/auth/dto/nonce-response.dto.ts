@@ -16,4 +16,14 @@ export class NonceResponseDto {
     example: '2026-02-13T10:05:00.000Z',
   })
   expiresAt: string;
+
+  @ApiProperty({
+    description:
+      'Canonical StepFi challenge message the wallet must sign. Contains domain, address, ' +
+      'statement, uri, version, nonce, issuedAt, expirationTime and networkPassphrase, ' +
+      'binding the signature to this API and environment. Echo it back in POST /auth/verify.',
+    example:
+      '{\n  "domain": "stepfi-api.onrender.com",\n  "address": "G...",\n  "statement": "StepFi requests...",\n  "uri": "https://stepfi-api.onrender.com/api/v1/auth/verify",\n  "version": "1.0.0",\n  "nonce": "a1b2c3d4e5f67890abcdef1234567890a1b2c3d4e5f67890abcdef1234567890",\n  "issuedAt": "2026-08-25T12:00:00.000Z",\n  "expirationTime": "2026-08-25T12:05:00.000Z",\n  "networkPassphrase": "Test SDF Network ; September 2015"\n}',
+  })
+  message: string;
 }

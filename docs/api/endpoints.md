@@ -21,9 +21,7 @@ Authorization: Bearer <access_token>
 
 ### POST /auth/nonce
 
-Generate a nonce for wallet signature authentication.
-
-**Status**: 🔴 Not Implemented (API-01)
+Generate a nonce and the canonical StepFi challenge message for wallet signature authentication.
 
 **Request**:
 ```json
@@ -32,13 +30,23 @@ Generate a nonce for wallet signature authentication.
 }
 ```
 
-**Response** (200 OK):
+**Response** (201 Created):
 ```json
 {
-  "nonce": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-  "expiresAt": "2026-02-13T10:05:00.000Z"
+  "nonce": "a1b2c3d4e5f67890abcdef1234567890a1b2c3d4e5f67890abcdef1234567890",
+  "expiresAt": "2026-02-13T10:05:00.000Z",
+  "message": "{\n  \"domain\": \"stepfi-api.onrender.com\",\n  \"address\": \"GABC...XYZ\",\n  \"statement\": \"StepFi requests that you sign this message to authenticate your wallet. This message does not trigger any blockchain transaction.\",\n  \"uri\": \"https://stepfi-api.onrender.com/api/v1/auth/verify\",\n  \"version\": \"1.0.0\",\n  \"nonce\": \"a1b2c3d4e5f67890abcdef1234567890a1b2c3d4e5f67890abcdef1234567890\",\n  \"issuedAt\": \"2026-02-13T10:00:00.000Z\",\n  \"expirationTime\": \"2026-02-13T10:05:00.000Z\",\n  \"networkPassphrase\": \"Test SDF Network ; September 2015\"\n}"
 }
 ```
+
+The `message` field is the exact text the wallet must sign. It binds the
+signature to StepFi's domain, URI, wallet address, nonce and network, so a
+signature captured from any other context cannot be replayed here. A SHA-256
+digest of this message is stored on the nonce row, and verification only ever
+accepts a signature over a message whose digest matches the stored challenge.
+
+**Errors**:
+- `400`: Invalid wallet format
 
 ---
 
@@ -46,29 +54,54 @@ Generate a nonce for wallet signature authentication.
 
 Verify wallet signature and receive JWT tokens.
 
-**Status**: 🔴 Not Implemented (API-02)
-
 **Request**:
 ```json
 {
   "wallet": "GABC...XYZ",
-  "signature": "MEUCIQ...",
-  "nonce": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+  "signature": "base64-ed25519-signature",
+  "nonce": "a1b2c3d4e5f67890abcdef1234567890a1b2c3d4e5f67890abcdef1234567890",
+  "signatureType": "envelope",
+  "message": "{\n  \"domain\": \"stepfi-api.onrender.com\",\n  ... same envelope returned by /auth/nonce ...\n}"
 }
 ```
+
+`signatureType` selects exactly one verification scheme (the server never
+tries multiple formats):
+
+- `envelope` — native clients: raw Ed25519 over the canonical envelope UTF-8
+  text returned by `/auth/nonce`.
+- `sep0043` — browser wallets (Freighter): Ed25519 over
+  `SHA-256("Stellar Signed Message:\n" + envelope)` (SEP-53).
+- `raw` — **deprecated** legacy scheme: raw Ed25519 over the bare nonce hex.
+  Only accepted while `AUTH_ALLOW_LEGACY_RAW_SIGNATURES=true` (migration
+  window, sunset **2026-10-31**). The sunset is enforced at runtime: after
+  that date legacy signatures are rejected with
+  `AUTH_LEGACY_SIGNATURE_DISABLED` even if the flag is still true (override
+  via `AUTH_LEGACY_SIGNATURES_SUNSET`).
+
+`message` is optional: when omitted, the server reconstructs the canonical
+challenge from the stored nonce row. Either way the signature is verified
+against a message whose digest matches the challenge stored with the nonce —
+client-supplied alternatives are rejected (`AUTH_CHALLENGE_MISMATCH`), as are
+messages bound to a foreign domain/URI/network
+(`AUTH_CHALLENGE_DOMAIN_MISMATCH`, `AUTH_CHALLENGE_URI_MISMATCH`,
+`AUTH_CHALLENGE_NETWORK_MISMATCH`) or expired envelopes (`AUTH_NONCE_EXPIRED`).
 
 **Response** (200 OK):
 ```json
 {
   "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
   "refreshToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-  "expiresIn": 900
+  "expiresIn": 900,
+  "tokenType": "Bearer"
 }
 ```
 
 **Errors**:
-- `400`: Invalid signature or nonce
-- `404`: Nonce not found or expired
+- `400`: Validation failed (wallet, nonce, signature, or signatureType)
+- `401`: Nonce not found/already used (`AUTH_NONCE_NOT_FOUND`), expired
+  (`AUTH_NONCE_EXPIRED`), or signature invalid
+  (`AUTH_SIGNATURE_INVALID` / `AUTH_CHALLENGE_*`)
 
 ---
 
