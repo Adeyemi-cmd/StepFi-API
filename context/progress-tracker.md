@@ -6,6 +6,41 @@ pure chore/docs commits). Direct pushes to main must also be logged here.
 
 ---
 
+## 2026-08-28
+
+- Fixed TOCTOU nonce reuse in `AuthService.verifySignature()` (src/modules/auth/auth.service.ts:111):
+  - **Atomic nonce consumption** — replaced `SELECT → verify → UPDATE` with atomic
+    conditional claim `UPDATE nonces SET used_at = now() WHERE id = ? AND used_at IS NULL`
+    executed **before** signature verification. Only the winner of the race gets
+    `count === 1` / `data.length === 1`; losers get `count === 0` and are rejected
+    with `AUTH_NONCE_NOT_FOUND`. This guarantees a given `(wallet, nonce)` can
+    produce at most one successful verification ever, even under concurrent
+    `POST /auth/verify` requests carrying the same stolen pair.
+  - **Burn-on-failure tradeoff documented in code** — if verification fails
+    (invalid signature, bad StrKey, or `expires_at` in the past) the nonce stays
+    burned. The caller must request a fresh nonce; this converts replay attacks
+    into DoS-on-self (one wasted challenge) versus unlimited session creation.
+    Chosen over RPC/locking because a single conditional `UPDATE` is natively atomic
+    in Postgres and fits the existing `SupabaseService.getServiceRoleClient()`
+    pattern without a new migration.
+  - **Per-wallet throttling on `POST /auth/verify`** — new `AuthWalletThrottlerGuard`
+    (src/modules/auth/auth-throttler.guard.ts) keys `@nestjs/throttler` on
+    `req.body.wallet` (fallback to `req.user.wallet` / IP) and is applied via
+    `@UseGuards(AuthWalletThrottlerGuard)` alongside the existing global
+    IP-based `ThrottlerGuard`. Route limit stays `5 req / 60 s` per wallet **and**
+    per IP, preventing offline-style brute force of the SEP-0043 fallback space
+    at network speed. `WalletThrottlerGuard` was also hardened to type-check
+    wallet strings and accept `body.wallet` so the same infrastructure is reused.
+  - **Tests** — extended `test/unit/modules/auth/auth.service.spec.ts` to prove
+    atomicity: parallel double-verify → exactly one success, replay after success
+    fails, replay after failure stays burned (`AUTH_SIGNATURE_INVALID` → `AUTH_NONCE_NOT_FOUND`),
+    expired nonce rejected and stays burned, atomic race via `count === 0` rejected.
+    Added `test/unit/modules/auth/auth-throttler.guard.spec.ts` for the wallet-keyed
+    throttler and updated `auth.controller.spec.ts` to mock the guard. `npm run build`
+    and `npm test` green (38 suites, 425 tests).
+
+---
+
 ## 2026-08-27
 
 - Closed the audit gaps on `POST /transactions/submit` (#117):
