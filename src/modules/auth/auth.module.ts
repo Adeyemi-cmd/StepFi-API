@@ -11,7 +11,6 @@ import { SupabaseService } from '../../database/supabase.client';
 import { UsersRepository } from '../../database/repositories/users.repository';
 import { getJwtConfig } from '../../config/jwt.config';
 import { AdminModule } from '../admin/admin.module';
-
 import { RolesGuard } from '../../auth/guards/roles.guard';
 
 @Module({

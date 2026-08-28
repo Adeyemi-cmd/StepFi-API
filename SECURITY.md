@@ -48,6 +48,14 @@ When reporting a vulnerability, please provide:
 
 1. **Wallet-Based Authentication**
    - Signature verification using Stellar cryptography
+   - Signatures are bound to a canonical StepFi challenge envelope (domain,
+     URI, wallet, nonce, issued-at, expires-at, network passphrase); the
+     nonce row stores a SHA-256 digest of the exact message, so a signature
+     captured from any other context cannot be replayed here
+   - Browser wallets verify per SEP-53; the legacy raw-nonce scheme is
+     deprecated and gated behind `AUTH_ALLOW_LEGACY_RAW_SIGNATURES`, and is
+     hard-disabled at runtime after `AUTH_LEGACY_SIGNATURES_SUNSET`
+     (default 2026-10-31) even if the flag is left true
    - Nonces expire after 5 minutes
    - JWTs expire after 15 minutes (access) / 7 days (refresh)
    - Refresh tokens are hashed before storage

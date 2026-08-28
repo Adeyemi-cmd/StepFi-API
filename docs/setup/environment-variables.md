@@ -75,6 +75,49 @@ JWT_REFRESH_EXPIRATION=7d
 NONCE_EXPIRATION=300
 ```
 
+### Wallet Signature Challenges (issue #118)
+
+Wallet authentication is bound to a canonical, domain-scoped challenge
+envelope signed by the wallet (see `docs/api/endpoints.md`). The envelope's
+`domain`, `uri` and `networkPassphrase` fields are derived from these
+variables; a signature bound to a different environment is rejected.
+
+```env
+# Base URL of the API. Used to derive the challenge envelope's `uri` field
+# (and the `domain` field when AUTH_CHALLENGE_DOMAIN is unset).
+API_URL=https://stepfi-api.onrender.com
+
+# Optional: exact host embedded in the challenge envelope's `domain` field.
+# Defaults to the host of API_URL. Must match the public origin clients
+# reach this API from.
+AUTH_CHALLENGE_DOMAIN=stepfi-api.onrender.com
+
+# Whether the deprecated legacy raw-nonce signature scheme (signature over
+# the bare nonce hex, no domain binding) is still accepted. Defaults to true
+# during the documented migration window; set to false to disable it
+# immediately. When false, legacy requests fail with
+# AUTH_LEGACY_SIGNATURE_DISABLED.
+AUTH_ALLOW_LEGACY_RAW_SIGNATURES=true
+
+# Hard cutoff (YYYY-MM-DD) for the legacy raw-nonce scheme. After this date
+# legacy signatures are rejected with AUTH_LEGACY_SIGNATURE_DISABLED even
+# while AUTH_ALLOW_LEGACY_RAW_SIGNATURES is still true, so the migration
+# window closes automatically at the sunset — no manual ops action required.
+# Defaults to 2026-10-31. Override to close the window early or (in an
+# emergency) to extend it. Malformed values fall back to the default.
+AUTH_LEGACY_SIGNATURES_SUNSET=2026-10-31
+```
+
+**Migration window**: existing mobile clients sign the bare nonce. They must
+be updated to sign the canonical challenge envelope returned by
+`POST /auth/nonce` (`signatureType: "envelope"`). Until the sunset date
+(**2026-10-31**) the legacy scheme remains accepted while
+`AUTH_ALLOW_LEGACY_RAW_SIGNATURES=true`; after that date the legacy scheme
+is rejected **at runtime** (the sunset is enforced in code, not just
+documented), so only domain-bound signatures are accepted even if the flag
+was never flipped. Set `AUTH_ALLOW_LEGACY_RAW_SIGNATURES=false`
+immediately if you do not need the migration window at all.
+
 ### Redis (Caching)
 
 ```env

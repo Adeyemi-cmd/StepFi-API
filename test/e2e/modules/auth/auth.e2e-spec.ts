@@ -2,6 +2,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { FastifyAdapter, NestFastifyApplication } from '@nestjs/platform-fastify';
 import * as request from 'supertest';
+import { createHash } from 'crypto';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { AuthModule } from '../../../../src/modules/auth/auth.module';
 import { UsersModule } from '../../../../src/modules/users/users.module';
@@ -9,6 +10,12 @@ import { HealthModule } from '../../../../src/modules/health/health.module';
 import { SupabaseService } from '../../../../src/database/supabase.client';
 import { createTestKeypair, signMessage } from '../../../helpers';
 import { createMockRegisterRequest } from '../../../fixtures';
+
+/** SEP-53 message signing: signature over SHA-256 of "Stellar Signed Message:\n" + message. */
+function signSep53(keypair: ReturnType<typeof createTestKeypair>, message: string): string {
+  const digest = createHash('sha256').update('Stellar Signed Message:\n' + message, 'utf8').digest();
+  return keypair.sign(digest).toString('base64');
+}
 
 describe('AuthController (e2e)', () => {
   let app: NestFastifyApplication;
@@ -104,9 +111,28 @@ describe('AuthController (e2e)', () => {
 
       expect(response.body).toHaveProperty('nonce');
       expect(response.body).toHaveProperty('expiresAt');
+      expect(response.body).toHaveProperty('message');
       expect(typeof response.body.nonce).toBe('string');
       expect(response.body.nonce).toHaveLength(64);
       expect(new Date(response.body.expiresAt).getTime()).toBeGreaterThan(Date.now());
+    });
+
+    it('should return a canonical challenge message bound to the wallet and nonce', async () => {
+      const wallet = createTestKeypair().publicKey();
+      testWallets.push(wallet);
+
+      const response = await request(app.getHttpServer())
+        .post('/auth/nonce')
+        .send({ wallet })
+        .expect(201);
+
+      const envelope = JSON.parse(response.body.message);
+      expect(envelope.address).toBe(wallet);
+      expect(envelope.nonce).toBe(response.body.nonce);
+      expect(envelope.domain).toBeTruthy();
+      expect(envelope.uri).toBeTruthy();
+      expect(envelope.expirationTime).toBe(response.body.expiresAt);
+      expect(envelope.networkPassphrase).toBeTruthy();
     });
 
     it('should return 400 with invalid wallet format (too short)', async () => {
@@ -278,6 +304,99 @@ describe('AuthController (e2e)', () => {
       await request(app.getHttpServer())
         .post('/auth/verify')
         .send({ wallet, nonce, signature })
+        .expect(401);
+    });
+
+    it('should complete full auth flow with the canonical envelope (native, signatureType envelope)', async () => {
+      const keypair = createTestKeypair();
+      const wallet = keypair.publicKey();
+      testWallets.push(wallet);
+
+      const nonceResponse = await request(app.getHttpServer())
+        .post('/auth/nonce')
+        .send({ wallet })
+        .expect(201);
+
+      const { nonce, message } = nonceResponse.body;
+      // Native clients sign the exact challenge message with raw Ed25519.
+      const signature = signMessage(keypair, message);
+
+      const verifyResponse = await request(app.getHttpServer())
+        .post('/auth/verify')
+        .send({ wallet, nonce, signature, signatureType: 'envelope', message })
+        .expect(200);
+
+      expect(verifyResponse.body).toHaveProperty('accessToken');
+      expect(verifyResponse.body).toHaveProperty('refreshToken');
+
+      await request(app.getHttpServer())
+        .get('/users/me')
+        .set('Authorization', `Bearer ${verifyResponse.body.accessToken}`)
+        .expect(200);
+    });
+
+    it('should complete full auth flow with a SEP-53 browser signature (signatureType sep0043)', async () => {
+      const keypair = createTestKeypair();
+      const wallet = keypair.publicKey();
+      testWallets.push(wallet);
+
+      const nonceResponse = await request(app.getHttpServer())
+        .post('/auth/nonce')
+        .send({ wallet })
+        .expect(201);
+
+      const { nonce, message } = nonceResponse.body;
+      // Browser wallets (Freighter) sign SHA-256("Stellar Signed Message:\n" + message).
+      const signature = signSep53(keypair, message);
+
+      const verifyResponse = await request(app.getHttpServer())
+        .post('/auth/verify')
+        .send({ wallet, nonce, signature, signatureType: 'sep0043', message })
+        .expect(200);
+
+      expect(verifyResponse.body).toHaveProperty('accessToken');
+      expect(verifyResponse.body).toHaveProperty('refreshToken');
+    });
+
+    it('should reject a tampered challenge message (not the one issued for the nonce)', async () => {
+      const keypair = createTestKeypair();
+      const wallet = keypair.publicKey();
+      testWallets.push(wallet);
+
+      const nonceResponse = await request(app.getHttpServer())
+        .post('/auth/nonce')
+        .send({ wallet })
+        .expect(201);
+
+      const { nonce, message } = nonceResponse.body;
+      const tampered = message.replace('authenticate your wallet', 'authenticate');
+      const signature = signMessage(keypair, tampered);
+
+      await request(app.getHttpServer())
+        .post('/auth/verify')
+        .send({ wallet, nonce, signature, signatureType: 'envelope', message: tampered })
+        .expect(401);
+    });
+
+    it('should reject a challenge message bound to a foreign domain', async () => {
+      const keypair = createTestKeypair();
+      const wallet = keypair.publicKey();
+      testWallets.push(wallet);
+
+      const nonceResponse = await request(app.getHttpServer())
+        .post('/auth/nonce')
+        .send({ wallet })
+        .expect(201);
+
+      const { nonce, message } = nonceResponse.body;
+      const envelope = JSON.parse(message);
+      envelope.domain = 'evil.example.com';
+      const foreign = JSON.stringify(envelope, null, 2);
+      const signature = signMessage(keypair, foreign);
+
+      await request(app.getHttpServer())
+        .post('/auth/verify')
+        .send({ wallet, nonce, signature, signatureType: 'envelope', message: foreign })
         .expect(401);
     });
   });

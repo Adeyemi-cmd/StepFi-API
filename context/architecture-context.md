@@ -84,8 +84,17 @@ Wallet address → `POST /auth/nonce` → client signs nonce with wallet →
 `POST /auth/verify` → JWT (access + refresh) issued.
 `POST /auth/refresh` rotates tokens.
 
-- SEP-0043 message signing supported for browser wallets (Freighter)
-- Raw Ed25519 signature verification for mobile (WalletConnect wallets)
+- Every accepted signature signs the canonical StepFi challenge envelope
+  (domain, URI, wallet, nonce, issued-at, expires-at, network passphrase);
+  the nonce row stores a SHA-256 digest of the exact message, so verification
+  only ever runs against the issued challenge (#118)
+- Browser wallets (Freighter) sign per SEP-53 (`signatureType: 'sep0043'`);
+  native clients sign the envelope with raw Ed25519
+  (`signatureType: 'envelope'`)
+- The legacy raw-nonce scheme is deprecated behind
+  `AUTH_ALLOW_LEGACY_RAW_SIGNATURES` and hard-disabled at runtime after
+  `AUTH_LEGACY_SIGNATURES_SUNSET` (default 2026-10-31), so the replayable
+  path closes automatically at the sunset even if the flag is left true
 - Nonces are single-use and expired by the `nonce-cleanup` cron
 
 ---

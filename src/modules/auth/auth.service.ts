@@ -15,15 +15,46 @@ import { NonceResponseDto } from './dto/nonce-response.dto';
 import { VerifyRequestDto } from './dto/verify-request.dto';
 import { AuthResponseDto } from './dto/auth-response.dto';
 import { RegisterRequestDto } from './dto/register-request.dto';
+import { AuditService } from '../admin/audit.service';
 import {
   ACCESS_TOKEN_EXPIRATION,
   ACCESS_TOKEN_EXPIRATION_SECONDS,
   REFRESH_TOKEN_EXPIRATION,
   REFRESH_TOKEN_EXPIRATION_MS,
 } from '../../config/jwt.config';
-import { AuditService } from '../admin/audit.service';
 
 const NONCE_EXPIRATION_SECONDS = 300;
+
+const SEP_53_PREFIX = 'Stellar Signed Message:\n';
+const CHALLENGE_VERSION = '1.0.0';
+const CHALLENGE_STATEMENT =
+  'StepFi requests that you sign this message to authenticate your wallet. ' +
+  'This message does not trigger any blockchain transaction.';
+const DEFAULT_NETWORK_PASSPHRASE = 'Test SDF Network ; September 2015';
+export const LEGACY_RAW_SIGNATURES_SUNSET = '2026-10-31';
+
+interface StoredNonce {
+  id: string;
+  expires_at: string;
+  issued_at: string | null;
+  message_hash: string | null;
+}
+
+interface ChallengeEnvelope {
+  domain: string;
+  address: string;
+  uri: string;
+  version: string;
+  nonce: string;
+  issuedAt: string;
+  expirationTime: string;
+  networkPassphrase: string;
+}
+
+function parseBooleanEnv(value: string | undefined, defaultValue: boolean): boolean {
+  if (value === undefined || value.trim() === '') return defaultValue;
+  return ['true', '1', 'yes', 'on'].includes(value.trim().toLowerCase());
+}
 
 interface RefreshTokenPayload {
   type?: string;
@@ -45,6 +76,11 @@ export interface RegisterResponse extends AuthResponseDto {
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
+  private readonly challengeDomain: string;
+  private readonly challengeUri: string;
+  private readonly networkPassphrase: string;
+  private readonly allowLegacyRawSignatures: boolean;
+  private readonly legacySignaturesSunset: Date;
 
   constructor(
     private readonly supabaseService: SupabaseService,
@@ -52,7 +88,21 @@ export class AuthService {
     private readonly configService: ConfigService,
     private readonly usersRepository: UsersRepository,
     private readonly auditService: AuditService,
-  ) {}
+  ) {
+    const apiUrl = (this.configService.get<string>('API_URL') ?? 'http://localhost:3000').replace(/\/+$/, '');
+    const apiPrefix = this.configService.get<string>('API_PREFIX') ?? 'api/v1';
+    this.challengeDomain = this.configService.get<string>('AUTH_CHALLENGE_DOMAIN') ?? this.resolveHost(apiUrl);
+    this.challengeUri = `${apiUrl}/${apiPrefix}/auth/verify`;
+    this.networkPassphrase =
+      this.configService.get<string>('STELLAR_NETWORK_PASSPHRASE') ?? DEFAULT_NETWORK_PASSPHRASE;
+    this.allowLegacyRawSignatures = parseBooleanEnv(
+      this.configService.get<string>('AUTH_ALLOW_LEGACY_RAW_SIGNATURES'),
+      true,
+    );
+    this.legacySignaturesSunset = this.resolveLegacySunset(
+      this.configService.get<string>('AUTH_LEGACY_SIGNATURES_SUNSET'),
+    );
+  }
 
   async register(dto: RegisterRequestDto, profileImage?: UploadedAvatarFile): Promise<RegisterResponse> {
     let avatarUrl: string | null = null;
@@ -93,26 +143,46 @@ export class AuthService {
     }
   }
 
+  /**
+   * Issues a single-use nonce together with the canonical, domain-bound
+   * challenge message the wallet must sign. A SHA-256 digest of the exact
+   * message is stored on the nonce row so verification can only ever run
+   * against that message — never against client-supplied alternatives.
+   */
   async generateNonce(wallet: string): Promise<NonceResponseDto> {
     const nonce = randomBytes(32).toString('hex');
+    const issuedAt = new Date();
     const expiresAt = new Date(Date.now() + NONCE_EXPIRATION_SECONDS * 1000);
+    const message = this.buildChallengeMessage({ wallet, nonce, issuedAt, expiresAt });
+    const messageHash = createHash('sha256').update(message, 'utf8').digest('hex');
     const client = this.supabaseService.getServiceRoleClient();
     const { error } = await client.from('nonces').insert({
       wallet_address: wallet,
       nonce,
       expires_at: expiresAt.toISOString(),
+      issued_at: issuedAt.toISOString(),
+      message_hash: messageHash,
     });
     if (error) {
       throw new InternalServerErrorException({ code: 'DATABASE_NONCE_INSERT_FAILED', message: 'Failed to generate nonce.' });
     }
-    return { nonce, expiresAt: expiresAt.toISOString() };
+    return { nonce, expiresAt: expiresAt.toISOString(), message };
   }
 
+  /**
+   * Verifies the wallet signature and marks the nonce used.
+   *
+   * Security model (issue #118): the server never tries multiple message
+   * formats. Exactly one scheme is used per request, selected by
+   * `signatureType`, and every canonical scheme verifies the signature
+   * against the exact message bound to the nonce row (SHA-256 digest stored
+   * at issue time) plus strict domain/URI/network/expiry validation.
+   */
   async verifySignature(dto: VerifyRequestDto): Promise<void> {
     const client = this.supabaseService.getServiceRoleClient();
     const { data: nonceRecord, error: nonceError } = await client
       .from('nonces')
-      .select('id, expires_at')
+      .select('id, expires_at, issued_at, message_hash')
       .eq('wallet_address', dto.wallet)
       .eq('nonce', dto.nonce)
       .is('used_at', null)
@@ -166,32 +236,220 @@ export class AuthService {
     }
     try {
       const keypair = Keypair.fromPublicKey(dto.wallet);
+      const signatureBuffer = Buffer.from(dto.signature, 'base64');
+      // The DTO default ('raw') is applied by the validation layer; the
+      // service treats an absent value the same way for direct callers.
+      const signatureType = dto.signatureType ?? 'raw';
 
-      let isValid = false;
+      if (signatureType === 'raw') {
+        // Legacy mobile scheme: signature over the bare nonce hex bytes.
+        // Deprecated — no domain binding, gated behind a config flag.
+        this.verifyLegacyRawSignature(keypair, dto.nonce, signatureBuffer);
+      } else {
+        const message = this.resolveChallengeMessage(dto, nonceRecord);
+        this.assertChallengeBinding(message, nonceRecord, dto);
 
-      // First attempt: raw Ed25519 signature (mobile clients)
-      try {
-        isValid = keypair.verify(Buffer.from(dto.nonce), Buffer.from(dto.signature, 'base64'));
-      } catch {
-        isValid = false;
-      }
-
-      // If raw verification failed, try SEP-0043 (browser wallets like Freighter)
-      if (!isValid) {
-        try {
-          const sepMessage = 'Stellar Signing Key: ' + dto.nonce;
-          isValid = keypair.verify(Buffer.from(sepMessage), Buffer.from(dto.signature, 'base64'));
-        } catch {
-          isValid = false;
+        if (signatureType === 'sep0043') {
+          // Browser wallets (SEP-53): signature over SHA-256 of
+          // "Stellar Signed Message:\n" + envelope.
+          const digest = createHash('sha256').update(SEP_53_PREFIX + message, 'utf8').digest();
+          if (!keypair.verify(digest, signatureBuffer)) {
+            throw new UnauthorizedException({ code: 'AUTH_SIGNATURE_INVALID', message: 'Invalid signature.' });
+          }
+        } else {
+          // Native clients: raw Ed25519 over the envelope UTF-8 bytes.
+          if (!keypair.verify(Buffer.from(message, 'utf8'), signatureBuffer)) {
+            throw new UnauthorizedException({ code: 'AUTH_SIGNATURE_INVALID', message: 'Invalid signature.' });
+          }
         }
-      }
-
-      if (!isValid) {
-        throw new UnauthorizedException({ code: 'AUTH_SIGNATURE_INVALID', message: 'Invalid signature.' });
       }
     } catch (err) {
       if (err instanceof UnauthorizedException) throw err;
       throw new UnauthorizedException({ code: 'AUTH_SIGNATURE_INVALID', message: 'Invalid signature.' });
+    }
+  }
+
+  /**
+   * Resolves the exact bytes to verify the signature against. Prefers the
+   * message the client echoes back (must still hash-match the stored
+   * challenge); falls back to reconstructing the canonical message from the
+   * stored nonce row.
+   */
+  private resolveChallengeMessage(dto: VerifyRequestDto, stored: StoredNonce): string {
+    if (dto.message) {
+      return dto.message;
+    }
+    if (!stored.issued_at || !stored.message_hash) {
+      throw new UnauthorizedException({ code: 'AUTH_SIGNATURE_INVALID', message: 'Invalid signature.' });
+    }
+    return this.buildChallengeMessage({
+      wallet: dto.wallet,
+      nonce: dto.nonce,
+      issuedAt: new Date(stored.issued_at),
+      expiresAt: new Date(stored.expires_at),
+    });
+  }
+
+  /**
+   * Enforces that the message being verified is exactly the challenge bound
+   * to the nonce row (stored SHA-256 digest) and that its envelope matches
+   * this environment and is not expired.
+   */
+  private assertChallengeBinding(message: string, stored: StoredNonce, dto: VerifyRequestDto): void {
+    if (!stored.message_hash) {
+      throw new UnauthorizedException({ code: 'AUTH_SIGNATURE_INVALID', message: 'Invalid signature.' });
+    }
+    const messageHash = createHash('sha256').update(message, 'utf8').digest('hex');
+    if (messageHash !== stored.message_hash) {
+      throw new UnauthorizedException({
+        code: 'AUTH_CHALLENGE_MISMATCH',
+        message: 'Signed message does not match the issued challenge.',
+      });
+    }
+
+    const envelope = this.parseChallengeEnvelope(message);
+
+    if (envelope.domain !== this.challengeDomain) {
+      throw new UnauthorizedException({
+        code: 'AUTH_CHALLENGE_DOMAIN_MISMATCH',
+        message: 'Challenge domain does not match this environment.',
+      });
+    }
+    if (envelope.uri !== this.challengeUri) {
+      throw new UnauthorizedException({
+        code: 'AUTH_CHALLENGE_URI_MISMATCH',
+        message: 'Challenge URI does not match this environment.',
+      });
+    }
+    if (envelope.networkPassphrase !== this.networkPassphrase) {
+      throw new UnauthorizedException({
+        code: 'AUTH_CHALLENGE_NETWORK_MISMATCH',
+        message: 'Challenge network does not match this environment.',
+      });
+    }
+    if (envelope.address !== dto.wallet || envelope.nonce !== dto.nonce || envelope.version !== CHALLENGE_VERSION) {
+      throw new UnauthorizedException({
+        code: 'AUTH_CHALLENGE_MISMATCH',
+        message: 'Signed message does not match the issued challenge.',
+      });
+    }
+    const expirationTime = Date.parse(envelope.expirationTime);
+    if (Number.isNaN(expirationTime) || expirationTime <= Date.now()) {
+      throw new UnauthorizedException({ code: 'AUTH_NONCE_EXPIRED', message: 'Challenge has expired.' });
+    }
+  }
+
+  /**
+   * Legacy verification: raw Ed25519 over the nonce hex bytes. No domain
+   * binding — accepted only while AUTH_ALLOW_LEGACY_RAW_SIGNATURES is
+   * enabled AND the runtime-enforced sunset (legacySignaturesSunset) has not
+   * passed. The sunset check runs before any signature verification, so the
+   * replayable scheme closes automatically on LEGACY_RAW_SIGNATURES_SUNSET
+   * even if an operator never flips the flag (issue #118).
+   */
+  private verifyLegacyRawSignature(keypair: Keypair, nonce: string, signatureBuffer: Buffer): void {
+    if (!this.allowLegacyRawSignatures) {
+      throw new UnauthorizedException({
+        code: 'AUTH_LEGACY_SIGNATURE_DISABLED',
+        message:
+          'Legacy raw nonce signatures are no longer accepted. ' +
+          'Please sign the canonical challenge message returned by POST /auth/nonce.',
+      });
+    }
+    if (Date.now() >= this.legacySignaturesSunset.getTime()) {
+      this.logger.warn(
+        `Rejecting legacy raw nonce signature: the migration window closed on ` +
+          `${LEGACY_RAW_SIGNATURES_SUNSET}. AUTH_ALLOW_LEGACY_RAW_SIGNATURES is still enabled but ` +
+          'the scheme is hard-disabled; flip the flag to false to silence this warning.',
+      );
+      throw new UnauthorizedException({
+        code: 'AUTH_LEGACY_SIGNATURE_DISABLED',
+        message:
+          `Legacy raw nonce signatures were disabled on ${LEGACY_RAW_SIGNATURES_SUNSET}. ` +
+          'Please sign the canonical challenge message returned by POST /auth/nonce.',
+      });
+    }
+    this.logger.warn(
+      `Legacy raw nonce signature accepted — AUTH_ALLOW_LEGACY_RAW_SIGNATURES is still enabled. ` +
+        `The scheme is hard-disabled at runtime after ${LEGACY_RAW_SIGNATURES_SUNSET}.`,
+    );
+    if (!keypair.verify(Buffer.from(nonce), signatureBuffer)) {
+      throw new UnauthorizedException({ code: 'AUTH_SIGNATURE_INVALID', message: 'Invalid signature.' });
+    }
+  }
+
+  /**
+   * Resolves the legacy signature sunset as a UTC Date. Falls back to
+   * LEGACY_RAW_SIGNATURES_SUNSET when the env var is unset or malformed, so
+   * a bad value can never silently disable the cutoff.
+   */
+  private resolveLegacySunset(raw: string | undefined): Date {
+    if (raw !== undefined && raw.trim() !== '') {
+      const parsed = new Date(raw);
+      if (!Number.isNaN(parsed.getTime())) {
+        return parsed;
+      }
+      this.logger.warn(
+        `Ignoring invalid AUTH_LEGACY_SIGNATURES_SUNSET="${raw}"; falling back to ${LEGACY_RAW_SIGNATURES_SUNSET}.`,
+      );
+    }
+    return new Date(`${LEGACY_RAW_SIGNATURES_SUNSET}T00:00:00.000Z`);
+  }
+
+  /**
+   * Builds the canonical StepFi challenge envelope. Deterministic: fixed key
+   * order and 2-space indentation, so the server can reproduce the exact
+   * bytes it issued (and clients sign exactly what they received).
+   */
+  private buildChallengeMessage(opts: { wallet: string; nonce: string; issuedAt: Date; expiresAt: Date }): string {
+    const envelope = {
+      domain: this.challengeDomain,
+      address: opts.wallet,
+      statement: CHALLENGE_STATEMENT,
+      uri: this.challengeUri,
+      version: CHALLENGE_VERSION,
+      nonce: opts.nonce,
+      issuedAt: opts.issuedAt.toISOString(),
+      expirationTime: opts.expiresAt.toISOString(),
+      networkPassphrase: this.networkPassphrase,
+    };
+    return JSON.stringify(envelope, null, 2);
+  }
+
+  /** Strictly parses the challenge envelope, rejecting malformed messages. */
+  private parseChallengeEnvelope(message: string): ChallengeEnvelope {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(message);
+    } catch {
+      throw new UnauthorizedException({ code: 'AUTH_SIGNATURE_INVALID', message: 'Invalid signature.' });
+    }
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      throw new UnauthorizedException({ code: 'AUTH_SIGNATURE_INVALID', message: 'Invalid signature.' });
+    }
+    const obj = parsed as Record<string, unknown>;
+    const { domain, address, uri, version, nonce, issuedAt, expirationTime, networkPassphrase } = obj;
+    if (
+      typeof domain !== 'string' ||
+      typeof address !== 'string' ||
+      typeof uri !== 'string' ||
+      typeof version !== 'string' ||
+      typeof nonce !== 'string' ||
+      typeof issuedAt !== 'string' ||
+      typeof expirationTime !== 'string' ||
+      typeof networkPassphrase !== 'string'
+    ) {
+      throw new UnauthorizedException({ code: 'AUTH_SIGNATURE_INVALID', message: 'Invalid signature.' });
+    }
+    return { domain, address, uri, version, nonce, issuedAt, expirationTime, networkPassphrase };
+  }
+
+  /** Extracts the host from an API URL, tolerating bare hosts. */
+  private resolveHost(apiUrl: string): string {
+    try {
+      return new URL(apiUrl).host;
+    } catch {
+      return apiUrl.split('/')[0] || 'localhost';
     }
   }
 

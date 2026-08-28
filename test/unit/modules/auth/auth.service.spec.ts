@@ -7,6 +7,7 @@ import { AuthService } from '../../../../src/modules/auth/auth.service';
 import { SupabaseService } from '../../../../src/database/supabase.client';
 import { UsersRepository } from '../../../../src/database/repositories/users.repository';
 import { AuditService } from '../../../../src/modules/admin/audit.service';
+import { VerifyRequestDto } from '../../../../src/modules/auth/dto/verify-request.dto';
 
 // Mock Stellar SDK to avoid real crypto operations in unit tests
 jest.mock('stellar-sdk', () => ({
@@ -15,6 +16,36 @@ jest.mock('stellar-sdk', () => ({
 }));
 
 import { Keypair, StrKey } from 'stellar-sdk';
+
+// Env values the service resolves in its constructor (matching the mocked
+// ConfigService below) so challenge envelopes can be reproduced in tests.
+// URL.host includes the port, so localhost:3000 is the challenge domain.
+const CHALLENGE_DOMAIN = 'localhost:3000';
+const CHALLENGE_URI = 'http://localhost:3000/api/v1/auth/verify';
+const NETWORK_PASSPHRASE = 'Test SDF Network ; September 2015';
+const CHALLENGE_STATEMENT =
+  'StepFi requests that you sign this message to authenticate your wallet. ' +
+  'This message does not trigger any blockchain transaction.';
+const SEP_53_PREFIX = 'Stellar Signed Message:\n';
+
+/** Reproduces the service's canonical challenge envelope serialization. */
+function buildChallengeMessage(wallet: string, nonce: string, issuedAt: Date, expiresAt: Date): string {
+  return JSON.stringify(
+    {
+      domain: CHALLENGE_DOMAIN,
+      address: wallet,
+      statement: CHALLENGE_STATEMENT,
+      uri: CHALLENGE_URI,
+      version: '1.0.0',
+      nonce,
+      issuedAt: issuedAt.toISOString(),
+      expirationTime: expiresAt.toISOString(),
+      networkPassphrase: NETWORK_PASSPHRASE,
+    },
+    null,
+    2,
+  );
+}
 
 describe('AuthService', () => {
   let service: AuthService;
@@ -34,7 +65,7 @@ describe('AuthService', () => {
   };
 
   const mockConfigService = {
-    get: jest.fn().mockReturnValue('mock-secret'),
+    get: jest.fn(),
   };
 
   const mockUsersRepository = {
@@ -53,7 +84,68 @@ describe('AuthService', () => {
 
   const validWallet = 'GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW';
 
+  /**
+   * Builds an AuthService with a ConfigService whose `get` returns the given
+   * overrides on top of the default test configuration.
+   */
+  function createServiceWithConfig(overrides: Record<string, unknown> = {}): AuthService {
+    const config = {
+      get: jest.fn((key: string) => {
+        if (key in overrides) {
+          return overrides[key];
+        }
+        switch (key) {
+          case 'API_URL':
+            return 'http://localhost:3000';
+          case 'API_PREFIX':
+            return 'api/v1';
+          case 'STELLAR_NETWORK_PASSPHRASE':
+            return NETWORK_PASSPHRASE;
+          case 'AUTH_CHALLENGE_DOMAIN':
+            return undefined;
+          case 'AUTH_ALLOW_LEGACY_RAW_SIGNATURES':
+            return undefined; // default: legacy accepted during migration window
+          case 'AUTH_LEGACY_SIGNATURES_SUNSET':
+            return undefined; // default: LEGACY_RAW_SIGNATURES_SUNSET (2026-10-31)
+          default:
+            return 'mock-secret';
+        }
+      }),
+    };
+    return new AuthService(
+      mockSupabaseService as unknown as SupabaseService,
+      mockJwtService as unknown as JwtService,
+      config as unknown as ConfigService,
+      mockUsersRepository as unknown as UsersRepository,
+      { log: jest.fn(), logWithBeforeAfter: jest.fn() } as unknown as AuditService,
+    );
+  }
+
+  /** Config mock matching the constructor's expectations. */
+  function configureConfigService() {
+    mockConfigService.get.mockImplementation((key: string) => {
+      switch (key) {
+        case 'API_URL':
+          return 'http://localhost:3000';
+        case 'API_PREFIX':
+          return 'api/v1';
+        case 'STELLAR_NETWORK_PASSPHRASE':
+          return NETWORK_PASSPHRASE;
+        case 'AUTH_CHALLENGE_DOMAIN':
+          return undefined;
+        case 'AUTH_ALLOW_LEGACY_RAW_SIGNATURES':
+          return undefined; // default: legacy accepted during migration window
+        case 'AUTH_LEGACY_SIGNATURES_SUNSET':
+          return undefined; // default: LEGACY_RAW_SIGNATURES_SUNSET (2026-10-31)
+        default:
+          return 'mock-secret';
+      }
+    });
+  }
+
   beforeEach(async () => {
+    configureConfigService();
+
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         AuthService,
@@ -70,7 +162,7 @@ describe('AuthService', () => {
     jest.clearAllMocks();
     mockInsert.mockResolvedValue({ error: null });
     mockJwtService.sign.mockReturnValue('mock.jwt.token');
-    mockConfigService.get.mockReturnValue('mock-secret');
+    configureConfigService();
     mockFrom.mockImplementation((table: string) => {
       if (table === 'users') {
         const chain: Record<string, jest.Mock> = {
@@ -113,11 +205,12 @@ describe('AuthService', () => {
   // generateNonce
   // ---------------------------------------------------------------------------
   describe('generateNonce', () => {
-    it('should return nonce and expiresAt', async () => {
+    it('should return nonce, expiresAt and a canonical challenge message', async () => {
       const result = await service.generateNonce(validWallet);
 
       expect(result).toHaveProperty('nonce');
       expect(result).toHaveProperty('expiresAt');
+      expect(result).toHaveProperty('message');
       expect(typeof result.nonce).toBe('string');
       expect(result.nonce).toHaveLength(64);
       expect(/^[a-f0-9]+$/.test(result.nonce)).toBe(true);
@@ -143,16 +236,33 @@ describe('AuthService', () => {
       expect(expiresAtTime).toBeLessThanOrEqual(after + fiveMinutes + tolerance);
     });
 
-    it('should store nonce in database with correct data', async () => {
-      await service.generateNonce(validWallet);
+    it('should return a challenge message bound to this environment, wallet and nonce', async () => {
+      const result = await service.generateNonce(validWallet);
+
+      const envelope = JSON.parse(result.message);
+      expect(envelope.domain).toBe(CHALLENGE_DOMAIN);
+      expect(envelope.address).toBe(validWallet);
+      expect(envelope.uri).toBe(CHALLENGE_URI);
+      expect(envelope.nonce).toBe(result.nonce);
+      expect(envelope.version).toBe('1.0.0');
+      expect(envelope.issuedAt).toBeDefined();
+      expect(envelope.expirationTime).toBe(result.expiresAt);
+      expect(envelope.networkPassphrase).toBe(NETWORK_PASSPHRASE);
+    });
+
+    it('should store nonce in database with the exact challenge message hash', async () => {
+      const result = await service.generateNonce(validWallet);
 
       expect(mockSupabaseService.getServiceRoleClient).toHaveBeenCalled();
       expect(mockFrom).toHaveBeenCalledWith('nonces');
+      const expectedHash = createHash('sha256').update(result.message, 'utf8').digest('hex');
       expect(mockInsert).toHaveBeenCalledWith(
         expect.objectContaining({
           wallet_address: validWallet,
           nonce: expect.any(String),
           expires_at: expect.any(String),
+          issued_at: expect.any(String),
+          message_hash: expectedHash,
         }),
       );
     });
@@ -167,7 +277,7 @@ describe('AuthService', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // verifySignature — validates nonce + Ed25519 signature, marks nonce used
+  // verifySignature — domain-bound challenge verification
   // ---------------------------------------------------------------------------
   describe('verifySignature', () => {
     const validNonce = 'a1b2c3d4e5f67890abcdef1234567890a1b2c3d4e5f67890abcdef1234567890';
@@ -176,11 +286,39 @@ describe('AuthService', () => {
 
     const defaultNonceRecord = { id: 'nonce-uuid', expires_at: futureExpiry };
 
+    type NonceResult = { data: object | null; error: { message: string } | null };
+
+    interface TestNonceRecord {
+      id: string;
+      expires_at: string;
+      issued_at: string;
+      message_hash: string;
+    }
+
+    /** Nonce record for a challenge issued ~1 minute ago, valid for 5 more. */
+    function buildNonceRecord(overrides: Partial<TestNonceRecord> = {}): TestNonceRecord {
+      const issuedAt = new Date(Date.now() - 60 * 1000);
+      const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
+      const message = buildChallengeMessage(validWallet, validNonce, issuedAt, expiresAt);
+      return {
+        id: 'nonce-uuid',
+        expires_at: expiresAt.toISOString(),
+        issued_at: issuedAt.toISOString(),
+        message_hash: createHash('sha256').update(message, 'utf8').digest('hex'),
+        ...overrides,
+      };
+    }
+
     function setupMocks({
       nonceResult = { data: defaultNonceRecord, error: null },
       claimResult = { data: [{ id: 'nonce-uuid' }], error: null, count: 1 },
       signatureValid = true,
       strKeyValid = true,
+    }: {
+      nonceResult?: NonceResult;
+      claimResult?: { data: unknown[] | null; error: unknown; count: number | null };
+      signatureValid?: boolean;
+      strKeyValid?: boolean;
     } = {}) {
       const mockKeypair = { verify: jest.fn().mockReturnValue(signatureValid) };
       (Keypair.fromPublicKey as jest.Mock).mockReturnValue(mockKeypair);
@@ -220,9 +358,11 @@ describe('AuthService', () => {
       return { mockKeypair };
     }
 
-    const validDto = { wallet: validWallet, nonce: validNonce, signature: validSignature };
+    const validDto: VerifyRequestDto = { wallet: validWallet, nonce: validNonce, signature: validSignature };
 
-    it('should resolve without error when nonce and signature are valid', async () => {
+    // --- legacy raw scheme (deprecated, migration window) -------------------
+
+    it('should resolve without error when nonce and signature are valid (legacy raw)', async () => {
       setupMocks();
       await expect(service.verifySignature(validDto)).resolves.toBeUndefined();
     });
@@ -273,7 +413,7 @@ describe('AuthService', () => {
       });
     });
 
-    it('should throw UnauthorizedException (AUTH_SIGNATURE_INVALID) when signature does not verify', async () => {
+    it('should throw UnauthorizedException (AUTH_SIGNATURE_INVALID) when legacy signature does not verify', async () => {
       setupMocks({ signatureValid: false });
 
       await expect(service.verifySignature(validDto)).rejects.toMatchObject({
@@ -292,7 +432,7 @@ describe('AuthService', () => {
       });
     });
 
-    it('should verify signature using Stellar Keypair with nonce bytes and base64 signature', async () => {
+    it('should verify a legacy signature using Stellar Keypair with nonce bytes and base64 signature', async () => {
       const { mockKeypair } = setupMocks();
       await service.verifySignature(validDto);
 
@@ -303,19 +443,168 @@ describe('AuthService', () => {
       );
     });
 
-    it('should verify using SEP-0043 if raw verification fails', async () => {
-      const { mockKeypair } = setupMocks({ signatureValid: false });
-      // First call (raw) returns false, second call (sep0043) should return true
-      mockKeypair.verify.mockImplementationOnce(() => false).mockImplementationOnce(() => true);
+    it('should reject legacy raw nonce signatures when AUTH_ALLOW_LEGACY_RAW_SIGNATURES is false', async () => {
+      const serviceWithLegacyOff = createServiceWithConfig({ AUTH_ALLOW_LEGACY_RAW_SIGNATURES: 'false' });
+      // A signature that WOULD verify (mock verify returns true) — the guard
+      // must reject it purely because the legacy scheme is disabled.
+      const { mockKeypair } = setupMocks({ signatureValid: true });
+      const legacyDto: VerifyRequestDto = { ...validDto, signatureType: 'raw' };
 
-      await expect(service.verifySignature(validDto)).resolves.toBeUndefined();
+      await expect(serviceWithLegacyOff.verifySignature(legacyDto)).rejects.toMatchObject({
+        response: { code: 'AUTH_LEGACY_SIGNATURE_DISABLED' },
+      });
+      expect(mockKeypair.verify).not.toHaveBeenCalled();
+    });
 
-      expect(Keypair.fromPublicKey).toHaveBeenCalledWith(validWallet);
-      expect(mockKeypair.verify).toHaveBeenCalledWith(Buffer.from(validNonce), Buffer.from(validSignature, 'base64'));
+    it('should reject legacy raw nonce signatures after the sunset date even when the flag is still true', async () => {
+      // AUTH_ALLOW_LEGACY_RAW_SIGNATURES=true but the sunset has passed — the
+      // runtime cutoff must close the replayable scheme anyway (issue #118).
+      const servicePastSunset = createServiceWithConfig({
+        AUTH_ALLOW_LEGACY_RAW_SIGNATURES: 'true',
+        AUTH_LEGACY_SIGNATURES_SUNSET: '2020-01-01',
+      });
+      const { mockKeypair } = setupMocks({ signatureValid: true });
+      const legacyDto: VerifyRequestDto = { ...validDto, signatureType: 'raw' };
+
+      await expect(servicePastSunset.verifySignature(legacyDto)).rejects.toMatchObject({
+        response: { code: 'AUTH_LEGACY_SIGNATURE_DISABLED' },
+      });
+      expect(mockKeypair.verify).not.toHaveBeenCalled();
+    });
+
+    it('should accept legacy raw nonce signatures while the flag is true and the sunset is in the future', async () => {
+      const serviceFutureSunset = createServiceWithConfig({
+        AUTH_ALLOW_LEGACY_RAW_SIGNATURES: 'true',
+        AUTH_LEGACY_SIGNATURES_SUNSET: '2999-01-01',
+      });
+      const { mockKeypair } = setupMocks();
+      const legacyDto: VerifyRequestDto = { ...validDto, signatureType: 'raw' };
+
+      await expect(serviceFutureSunset.verifySignature(legacyDto)).resolves.toBeUndefined();
       expect(mockKeypair.verify).toHaveBeenCalledWith(
-        Buffer.from('Stellar Signing Key: ' + validNonce),
+        Buffer.from(validNonce),
         Buffer.from(validSignature, 'base64'),
       );
+    });
+
+    // --- canonical envelope: native (signatureType 'envelope') --------------
+
+    it('should accept a native signature over the canonical envelope (signatureType envelope)', async () => {
+      const record = buildNonceRecord();
+      const { mockKeypair } = setupMocks({ nonceResult: { data: record, error: null } });
+      const message = buildChallengeMessage(validWallet, validNonce, new Date(record.issued_at), new Date(record.expires_at));
+      const dto: VerifyRequestDto = { ...validDto, signatureType: 'envelope', message };
+
+      await expect(service.verifySignature(dto)).resolves.toBeUndefined();
+
+      expect(mockKeypair.verify).toHaveBeenCalledWith(
+        Buffer.from(message, 'utf8'),
+        Buffer.from(validSignature, 'base64'),
+      );
+    });
+
+    it('should verify a canonical signature against the reconstructed message when the client omits message', async () => {
+      const record = buildNonceRecord();
+      const { mockKeypair } = setupMocks({ nonceResult: { data: record, error: null } });
+      const dto: VerifyRequestDto = { ...validDto, signatureType: 'envelope' };
+
+      await expect(service.verifySignature(dto)).resolves.toBeUndefined();
+
+      const message = buildChallengeMessage(validWallet, validNonce, new Date(record.issued_at), new Date(record.expires_at));
+      expect(mockKeypair.verify).toHaveBeenCalledWith(
+        Buffer.from(message, 'utf8'),
+        Buffer.from(validSignature, 'base64'),
+      );
+    });
+
+    it('should reject a client-supplied message that does not match the stored challenge hash', async () => {
+      const record = buildNonceRecord();
+      setupMocks({ nonceResult: { data: record, error: null } });
+      const message = buildChallengeMessage(validWallet, validNonce, new Date(record.issued_at), new Date(record.expires_at));
+      const tampered = message.replace('authenticate your wallet', 'authenticate');
+      const dto: VerifyRequestDto = { ...validDto, signatureType: 'envelope', message: tampered };
+
+      await expect(service.verifySignature(dto)).rejects.toMatchObject({
+        response: { code: 'AUTH_CHALLENGE_MISMATCH' },
+      });
+    });
+
+    it('should reject a canonical challenge whose envelope expirationTime has passed', async () => {
+      const issuedAt = new Date(Date.now() - 10 * 60 * 1000);
+      const expiresAt = new Date(Date.now() - 5 * 60 * 1000); // envelope expired
+      const message = buildChallengeMessage(validWallet, validNonce, issuedAt, expiresAt);
+      const record = buildNonceRecord({
+        expires_at: futureExpiry, // DB row still valid — envelope expiry is enforced separately
+        issued_at: issuedAt.toISOString(),
+        message_hash: createHash('sha256').update(message, 'utf8').digest('hex'),
+      });
+      setupMocks({ nonceResult: { data: record, error: null } });
+      const dto: VerifyRequestDto = { ...validDto, signatureType: 'envelope', message };
+
+      await expect(service.verifySignature(dto)).rejects.toMatchObject({
+        response: { code: 'AUTH_NONCE_EXPIRED' },
+      });
+    });
+
+    it('should reject canonical verification when the nonce row has no stored challenge hash', async () => {
+      setupMocks({
+        nonceResult: {
+          data: { id: 'nonce-uuid', expires_at: futureExpiry, issued_at: null, message_hash: null },
+          error: null,
+        },
+      });
+      const message = buildChallengeMessage(validWallet, validNonce, new Date(), new Date(Date.now() + 5 * 60 * 1000));
+      const dto: VerifyRequestDto = { ...validDto, signatureType: 'envelope', message };
+
+      await expect(service.verifySignature(dto)).rejects.toMatchObject({
+        response: { code: 'AUTH_SIGNATURE_INVALID' },
+      });
+    });
+
+    // --- canonical envelope: browser (signatureType 'sep0043', SEP-53) ------
+
+    it('should accept a SEP-53 browser signature over the canonical envelope (signatureType sep0043)', async () => {
+      const record = buildNonceRecord();
+      const { mockKeypair } = setupMocks({ nonceResult: { data: record, error: null } });
+      const message = buildChallengeMessage(validWallet, validNonce, new Date(record.issued_at), new Date(record.expires_at));
+      const dto: VerifyRequestDto = { ...validDto, signatureType: 'sep0043', message };
+
+      await expect(service.verifySignature(dto)).resolves.toBeUndefined();
+
+      const digest = createHash('sha256').update(SEP_53_PREFIX + message, 'utf8').digest();
+      expect(mockKeypair.verify).toHaveBeenCalledWith(digest, Buffer.from(validSignature, 'base64'));
+    });
+
+    it('should reject a SEP-53 signature whose envelope domain does not match our host', async () => {
+      const record = buildNonceRecord();
+      const message = buildChallengeMessage(validWallet, validNonce, new Date(record.issued_at), new Date(record.expires_at));
+      const foreignMessage = message.replace('"domain": "localhost:3000"', '"domain": "evil.example.com"');
+      // Simulates a nonce row whose stored binding points at a foreign domain
+      // (e.g. a challenge issued by another environment being replayed here).
+      const tamperedRecord = buildNonceRecord({
+        message_hash: createHash('sha256').update(foreignMessage, 'utf8').digest('hex'),
+      });
+      setupMocks({ nonceResult: { data: tamperedRecord, error: null } });
+      const dto: VerifyRequestDto = { ...validDto, signatureType: 'sep0043', message: foreignMessage };
+
+      await expect(service.verifySignature(dto)).rejects.toMatchObject({
+        response: { code: 'AUTH_CHALLENGE_DOMAIN_MISMATCH' },
+      });
+    });
+
+    it('should reject a canonical signature when the envelope network passphrase does not match', async () => {
+      const record = buildNonceRecord();
+      const message = buildChallengeMessage(validWallet, validNonce, new Date(record.issued_at), new Date(record.expires_at));
+      const foreignMessage = message.replace(NETWORK_PASSPHRASE, 'Public Global Stellar Network ; September 2015');
+      const tamperedRecord = buildNonceRecord({
+        message_hash: createHash('sha256').update(foreignMessage, 'utf8').digest('hex'),
+      });
+      setupMocks({ nonceResult: { data: tamperedRecord, error: null } });
+      const dto: VerifyRequestDto = { ...validDto, signatureType: 'sep0043', message: foreignMessage };
+
+      await expect(service.verifySignature(dto)).rejects.toMatchObject({
+        response: { code: 'AUTH_CHALLENGE_NETWORK_MISMATCH' },
+      });
     });
 
     it('should mark nonce as used via atomic claim before signature verification', async () => {
