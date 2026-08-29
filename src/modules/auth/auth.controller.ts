@@ -1,21 +1,23 @@
-import { 
-  Controller, 
-  Post, 
-  Body, 
-  HttpCode, 
-  HttpStatus, 
+import {
+  Controller,
+  Post,
+  Body,
+  HttpCode,
+  HttpStatus,
   NestInterceptor,
   ExecutionContext,
   CallHandler,
-  UseInterceptors, 
-  UploadedFile, 
-  ParseFilePipe, 
-  MaxFileSizeValidator, 
-  FileTypeValidator 
+  UseInterceptors,
+  UseGuards,
+  UploadedFile,
+  ParseFilePipe,
+  MaxFileSizeValidator,
+  FileTypeValidator,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiConsumes, ApiBody } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import { AuthService, RegisterResponse } from './auth.service';
+import { AuthWalletThrottlerGuard } from './auth-throttler.guard';
 import { UploadedAvatarFile } from '../../database/repositories/users.repository';
 import { NonceRequestDto } from './dto/nonce-request.dto';
 import { NonceResponseDto } from './dto/nonce-response.dto';
@@ -73,9 +75,11 @@ export class AuthController {
   @Post('verify')
   @HttpCode(HttpStatus.OK)
   @Throttle({ default: { limit: 5, ttl: 60000 } })
+  @UseGuards(AuthWalletThrottlerGuard)
   @ApiOperation({ summary: 'Verify wallet signature and issue JWT tokens' })
   @ApiResponse({ status: 200, description: 'Signature verified — JWT tokens issued', type: AuthResponseDto })
   @ApiResponse({ status: 401, description: 'Invalid signature or nonce' })
+  @ApiResponse({ status: 429, description: 'Too many requests - rate limit exceeded (per wallet or per IP)' })
   async verify(@Body() dto: VerifyRequestDto): Promise<AuthResponseDto> {
     await this.authService.verifySignature(dto);
     return this.authService.generateTokens(dto.wallet);

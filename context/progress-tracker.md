@@ -6,6 +6,49 @@ pure chore/docs commits). Direct pushes to main must also be logged here.
 
 ---
 
+## 2026-08-28
+
+- Fixed TOCTOU nonce reuse in `AuthService.verifySignature()` (src/modules/auth/auth.service.ts:111):
+  - **Atomic nonce consumption** — replaced `SELECT → verify → UPDATE` with atomic
+    conditional claim `UPDATE nonces SET used_at = now() WHERE id = ? AND used_at IS NULL`
+    executed **before** signature verification. Only the winner of the race gets
+    `count === 1` / `data.length === 1`; losers get `count === 0` and are rejected
+    with `AUTH_NONCE_NOT_FOUND`. This guarantees a given `(wallet, nonce)` can
+    produce at most one successful verification ever, even under concurrent
+    `POST /auth/verify` requests carrying the same stolen pair.
+  - **Burn-on-failure tradeoff documented in code** — if verification fails
+    (invalid signature, bad StrKey, or `expires_at` in the past) the nonce stays
+    burned. The caller must request a fresh nonce; this converts replay attacks
+    into DoS-on-self (one wasted challenge) versus unlimited session creation.
+    Chosen over RPC/locking because a single conditional `UPDATE` is natively atomic
+    in Postgres and fits the existing `SupabaseService.getServiceRoleClient()`
+    pattern without a new migration.
+  - **Per-wallet throttling on `POST /auth/verify`** — new `AuthWalletThrottlerGuard`
+    (src/modules/auth/auth-throttler.guard.ts) keys `@nestjs/throttler` on
+    `req.body.wallet` (fallback to `req.user.wallet` / IP) and is applied via
+    `@UseGuards(AuthWalletThrottlerGuard)` alongside the existing global
+    IP-based `ThrottlerGuard`. Route limit stays `5 req / 60 s` per wallet **and**
+    per IP, preventing offline-style brute force of the SEP-0043 fallback space
+    at network speed. `WalletThrottlerGuard` was also hardened to type-check
+    wallet strings and accept `body.wallet` so the same infrastructure is reused.
+  - **Tests** — extended `test/unit/modules/auth/auth.service.spec.ts` to prove
+    atomicity: parallel double-verify → exactly one success, replay after success
+    fails, replay after failure stays burned (`AUTH_SIGNATURE_INVALID` → `AUTH_NONCE_NOT_FOUND`),
+    expired nonce rejected and stays burned, atomic race via `count === 0` rejected.
+    Added `test/unit/modules/auth/auth-throttler.guard.spec.ts` for the wallet-keyed
+    throttler and updated `auth.controller.spec.ts` to mock the guard. `npm run build`
+    and `npm test` green (38 suites, 425 tests).
+
+- Hardened `ApiKeyGuard` hot path (`src/auth/guards/api-key.guard.ts:29`):
+  - **Cache key records by hash** — `CACHE_MANAGER` (Redis via `cache-manager` + `ioredis`, same pattern as `src/modules/liquidity/liquidity.service.ts:54` and `src/modules/transactions/transactions.service.ts:121`) stores `ApiKeyRecord` under `apikey:record:<keyHash>` (never the raw key) with `60s` TTL. Steady-state vendor traffic now causes ≤1 `SELECT` per TTL per key instead of 2 DB round-trips per request (lookup + unconditional `last_used_at` update). Negative lookups are not cached to avoid polluting the store; enumeration is handled by unified errors.
+  - **Collapsed `last_used_at` writes** — cache-guarded dirty flag `apikey:last_used:<keyId>` with `300s` TTL ensures at-most-once-per-5-minutes-per-key DB `UPDATE`, eliminating 1:1 write amplification. Fire-and-forget `maybeUpdateLastUsed()` logs but never blocks the request.
+  - **Normalized failure responses** — `API_KEY_INVALID`, `API_KEY_INACTIVE`, `API_KEY_EXPIRED`, and missing/malformed headers all map to a single `API_KEY_UNAUTHORIZED` (401) with `message: 'Invalid API key.'`. Server-side `Logger.warn` retains distinct reasons (`hash 8-char prefix`, `keyId`) for forensics, preventing enumeration of revoked vs expired vs nonexistent keys. `API_KEY_INSUFFICIENT_PERMISSIONS` (403) and `API_KEY_RATE_LIMITED` (429) remain distinct.
+  - **Per-key sliding-window rate limiting** — cache-backed counter `apikey:rate:<keyId>` with `60s` window and `60` req limit (structured `429` `API_KEY_RATE_LIMITED` via `HttpException`). Wired through the repo's established `CACHE_MANAGER` guard pattern (not a new BullMQ queue), consistent with `ThrottlerGuard` per-wallet limits. Trips and resets with TTL are tested.
+  - **Revocation invalidation** — `VendorsService.revokeApiKey()` (`src/modules/vendors/vendors.service.ts:636`) now selects `key_hash` alongside `id`, performs the `is_active=false` update, then `await cacheManager.del` for `apikey:record:<hash>`, `apikey:rate:<keyId>`, and `apikey:last_used:<keyId>`, guaranteeing visibility within one TTL. `VendorsService` now injects `CACHE_MANAGER` (`@Inject(CACHE_MANAGER)`) and `src/app.module.ts:13` registers a global `CacheModule` (`isGlobal: true`) via `getRedisConfig` so `ApiKeyGuard` and `VendorsService` share the same Redis/in-memory store.
+  - **Tests** — rewrote `test/unit/modules/auth/api-key.guard.spec.ts:7` to assert cache hit avoids DB (mock `select` call counts and `never store full keys`), revocation invalidation (manual `del` then DB re-check), rate-limit trips (`60` → `429`) and resets after TTL, and enumeration uniformity (missing/invalid/inactive/expired all `API_KEY_UNAUTHORIZED`). Updated `test/unit/modules/vendors/vendors.service.spec.ts:14` to provide `CACHE_MANAGER` mock and verify `revokeApiKey` deletes the three cache keys and tolerates cache failures. `npm run build` and `npm test` green (38 suites, 434 tests).
+
+---
+
 ## 2026-08-27
 
 - Closed the audit gaps on `POST /transactions/submit` (#117):

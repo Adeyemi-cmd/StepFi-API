@@ -190,9 +190,47 @@ export class AuthService {
     if (nonceError || !nonceRecord) {
       throw new UnauthorizedException({ code: 'AUTH_NONCE_NOT_FOUND', message: 'Nonce not found or already used.' });
     }
-    if (new Date(nonceRecord.expires_at) < new Date()) {
+
+    // Atomic nonce claim: consume the row BEFORE expensive signature verification.
+    // The conditional UPDATE ... WHERE id = ? AND used_at IS NULL is a single
+    // atomic statement in Postgres. Two concurrent verify requests that both
+    // observed the same unused row above will race here; only one UPDATE will
+    // affect a row (count === 1). The loser gets count === 0 / empty data and
+    // is rejected as already consumed. This eliminates the TOCTOU window that
+    // previously existed between the SELECT and the trailing UPDATE.
+    //
+    // SECURITY TRADEOFF: if signature verification subsequently fails (or the
+    // nonce is expired), the nonce stays burned. Callers must request a fresh
+    // nonce and re-sign. This converts a replay of a stolen nonce+signature
+    // into a DoS-on-self (one wasted challenge) which is the correct tradeoff
+    // versus allowing unlimited session creation from a single intercepted pair.
+    const claimedAt = new Date().toISOString();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Supabase builder count typings for update().select() chain are incomplete; need runtime count check
+    const claimResult: any = await (client.from('nonces') as any)
+      .update({ used_at: claimedAt }, { count: 'exact' })
+      .eq('id', (nonceRecord as { id: string }).id)
+      .is('used_at', null)
+      .select('id');
+    const claimError = claimResult?.error as { message: string } | null | undefined;
+    const claimData = claimResult?.data as unknown[] | null | undefined;
+    const claimCount = claimResult?.count as number | null | undefined;
+    if (claimError) {
+      throw new InternalServerErrorException({
+        code: 'DATABASE_NONCE_CLAIM_FAILED',
+        message: 'Failed to claim nonce.',
+      });
+    }
+    const claimedCount = typeof claimCount === 'number' ? claimCount : (claimData?.length ?? 0);
+    if (claimedCount === 0) {
+      throw new UnauthorizedException({ code: 'AUTH_NONCE_NOT_FOUND', message: 'Nonce not found or already used.' });
+    }
+
+    // Nonce is now burned regardless of outcome below. Check expiry AFTER the
+    // claim so an expired row is still consumed and cannot be retried.
+    if (new Date((nonceRecord as { expires_at: string }).expires_at) < new Date()) {
       throw new UnauthorizedException({ code: 'AUTH_NONCE_EXPIRED', message: 'Nonce has expired.' });
     }
+
     if (!StrKey.isValidEd25519PublicKey(dto.wallet)) {
       throw new UnauthorizedException({ code: 'AUTH_SIGNATURE_INVALID', message: 'Invalid signature.' });
     }
@@ -229,7 +267,6 @@ export class AuthService {
       if (err instanceof UnauthorizedException) throw err;
       throw new UnauthorizedException({ code: 'AUTH_SIGNATURE_INVALID', message: 'Invalid signature.' });
     }
-    await client.from('nonces').update({ used_at: new Date().toISOString() }).eq('id', nonceRecord.id);
   }
 
   /**

@@ -311,12 +311,12 @@ describe('AuthService', () => {
 
     function setupMocks({
       nonceResult = { data: defaultNonceRecord, error: null },
-      markUsedResult = { error: null },
+      claimResult = { data: [{ id: 'nonce-uuid' }], error: null, count: 1 },
       signatureValid = true,
       strKeyValid = true,
     }: {
       nonceResult?: NonceResult;
-      markUsedResult?: { error: unknown };
+      claimResult?: { data: unknown[] | null; error: unknown; count: number | null };
       signatureValid?: boolean;
       strKeyValid?: boolean;
     } = {}) {
@@ -326,18 +326,31 @@ describe('AuthService', () => {
 
       mockFrom.mockImplementation((table: string) => {
         if (table === 'nonces') {
-          const updateChain = { eq: jest.fn().mockResolvedValue(markUsedResult) };
-          const chain: Record<string, jest.Mock> = {
+          // Builder that supports both:
+          // SELECT: select().eq().is().single()  -> nonceResult
+          // CLAIM:  update().eq().is().select()   -> claimResult
+          const builder: Record<string, jest.Mock> = {
             select: jest.fn(),
             eq: jest.fn(),
             is: jest.fn(),
             single: jest.fn().mockResolvedValue(nonceResult),
-            update: jest.fn().mockReturnValue(updateChain),
+            update: jest.fn(),
           };
-          chain.select.mockReturnValue(chain);
-          chain.eq.mockReturnValue(chain);
-          chain.is.mockReturnValue(chain);
-          return chain;
+          let operation: 'select' | 'update' = 'select';
+          builder.select.mockImplementation((..._args: unknown[]) => {
+            if (operation === 'update') {
+              // This is the terminal select after update().eq().is().select()
+              return Promise.resolve(claimResult);
+            }
+            return builder;
+          });
+          builder.update.mockImplementation(() => {
+            operation = 'update';
+            return builder;
+          });
+          builder.eq.mockReturnValue(builder);
+          builder.is.mockReturnValue(builder);
+          return builder;
         }
         return { insert: mockInsert };
       });
@@ -371,10 +384,19 @@ describe('AuthService', () => {
       });
     });
 
-    it('should throw UnauthorizedException (AUTH_NONCE_EXPIRED) when nonce is past expiry', async () => {
+    it('should throw UnauthorizedException (AUTH_NONCE_NOT_FOUND) when atomic claim loses the race (count === 0)', async () => {
+      setupMocks({ claimResult: { data: [], error: null, count: 0 } });
+
+      await expect(service.verifySignature(validDto)).rejects.toMatchObject({
+        response: { code: 'AUTH_NONCE_NOT_FOUND' },
+      });
+    });
+
+    it('should throw UnauthorizedException (AUTH_NONCE_EXPIRED) when nonce is past expiry (nonce stays burned)', async () => {
       const expiredDate = new Date(Date.now() - 1000).toISOString();
       setupMocks({
         nonceResult: { data: { id: 'nonce-uuid', expires_at: expiredDate }, error: null },
+        claimResult: { data: [{ id: 'nonce-uuid' }], error: null, count: 1 },
       });
 
       await expect(service.verifySignature(validDto)).rejects.toMatchObject({
@@ -383,6 +405,7 @@ describe('AuthService', () => {
     });
 
     it('should throw UnauthorizedException (AUTH_SIGNATURE_INVALID) when StrKey validation fails', async () => {
+      // StrKey check happens after claim; claim should have succeeded
       setupMocks({ strKeyValid: false });
 
       await expect(service.verifySignature(validDto)).rejects.toMatchObject({
@@ -584,11 +607,282 @@ describe('AuthService', () => {
       });
     });
 
-    it('should mark nonce as used after successful verification', async () => {
+    it('should mark nonce as used via atomic claim before signature verification', async () => {
       setupMocks();
       await service.verifySignature(validDto);
 
       expect(mockFrom).toHaveBeenCalledWith('nonces');
+    });
+
+    it('should burn the nonce even when signature verification fails (DoS-on-self tradeoff)', async () => {
+      // Claim succeeds, but signature invalid — nonce stays burned, replay should get NOT_FOUND
+      const claimCallCount = { count: 0 };
+      const mockKeypair = { verify: jest.fn().mockReturnValue(false) };
+      (Keypair.fromPublicKey as jest.Mock).mockReturnValue(mockKeypair);
+      (StrKey.isValidEd25519PublicKey as jest.Mock).mockReturnValue(true);
+
+      mockFrom.mockImplementation((table: string) => {
+        if (table === 'nonces') {
+          const builder: Record<string, jest.Mock> = {
+            select: jest.fn(),
+            eq: jest.fn(),
+            is: jest.fn(),
+            single: jest.fn(),
+            update: jest.fn(),
+          };
+          let operation: 'select' | 'update' = 'select';
+          // First verify: SELECT returns the nonce, CLAIM succeeds (count 1)
+          // Second verify (replay): claim would lose or SELECT already empty
+          builder.single.mockImplementation(() => {
+            // For this test we always return the nonce for SELECT, so the second
+            // call's failure is due to claim burning semantics, not SELECT miss.
+            // The service should still throw AUTH_NONCE_NOT_FOUND on second call
+            // because count === 0 (simulated via claimCallCount).
+            return Promise.resolve({ data: defaultNonceRecord, error: null });
+          });
+          builder.select.mockImplementation((..._args: unknown[]) => {
+            if (operation === 'update') {
+              claimCallCount.count += 1;
+              if (claimCallCount.count === 1) {
+                return Promise.resolve({ data: [{ id: 'nonce-uuid' }], error: null, count: 1 });
+              }
+              return Promise.resolve({ data: [], error: null, count: 0 });
+            }
+            return builder;
+          });
+          builder.update.mockImplementation(() => {
+            operation = 'update';
+            return builder;
+          });
+          builder.eq.mockReturnValue(builder);
+          builder.is.mockReturnValue(builder);
+          return builder;
+        }
+        return { insert: mockInsert };
+      });
+
+      // First call: claim succeeds but signature fails -> AUTH_SIGNATURE_INVALID, nonce burned
+      await expect(service.verifySignature(validDto)).rejects.toMatchObject({
+        response: { code: 'AUTH_SIGNATURE_INVALID' },
+      });
+
+      // Fix signature to be valid, but nonce is already burned -> should get NOT_FOUND, not success
+      mockKeypair.verify.mockReturnValue(true);
+      await expect(service.verifySignature(validDto)).rejects.toMatchObject({
+        response: { code: 'AUTH_NONCE_NOT_FOUND' },
+      });
+    });
+  });
+
+  describe('verifySignature — atomicity / concurrency', () => {
+    const validNonce = 'a1b2c3d4e5f67890abcdef1234567890a1b2c3d4e5f67890abcdef1234567890';
+    const validSignature = Buffer.alloc(64).toString('base64');
+    const futureExpiry = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+    const defaultNonceRecord = { id: 'nonce-uuid', expires_at: futureExpiry };
+    const validDto = { wallet: validWallet, nonce: validNonce, signature: validSignature };
+
+    it('parallel double-verify yields exactly one success (atomic claim)', async () => {
+      const mockKeypair = { verify: jest.fn().mockReturnValue(true) };
+      (Keypair.fromPublicKey as jest.Mock).mockReturnValue(mockKeypair);
+      (StrKey.isValidEd25519PublicKey as jest.Mock).mockReturnValue(true);
+
+      let claimAttempts = 0;
+      mockFrom.mockImplementation((table: string) => {
+        if (table === 'nonces') {
+          const builder: Record<string, jest.Mock> = {
+            select: jest.fn(),
+            eq: jest.fn(),
+            is: jest.fn(),
+            single: jest.fn().mockResolvedValue({ data: defaultNonceRecord, error: null }),
+            update: jest.fn(),
+          };
+          let op: 'select' | 'update' = 'select';
+          builder.select.mockImplementation((..._args: unknown[]) => {
+            if (op === 'update') {
+              claimAttempts += 1;
+              if (claimAttempts === 1) {
+                return Promise.resolve({ data: [{ id: 'nonce-uuid' }], error: null, count: 1 });
+              }
+              return Promise.resolve({ data: [], error: null, count: 0 });
+            }
+            return builder;
+          });
+          builder.update.mockImplementation(() => {
+            op = 'update';
+            return builder;
+          });
+          builder.eq.mockReturnValue(builder);
+          builder.is.mockReturnValue(builder);
+          return builder;
+        }
+        return { insert: mockInsert };
+      });
+
+      const results = await Promise.allSettled([
+        service.verifySignature(validDto),
+        service.verifySignature(validDto),
+      ]);
+
+      const fulfilled = results.filter((r) => r.status === 'fulfilled');
+      const rejected = results.filter((r) => r.status === 'rejected');
+
+      expect(fulfilled).toHaveLength(1);
+      expect(rejected).toHaveLength(1);
+      const rejectedReason = (rejected[0] as PromiseRejectedResult).reason as { response: { code: string } };
+      expect(rejectedReason.response.code).toBe('AUTH_NONCE_NOT_FOUND');
+    });
+
+    it('replay after success fails with AUTH_NONCE_NOT_FOUND', async () => {
+      const mockKeypair = { verify: jest.fn().mockReturnValue(true) };
+      (Keypair.fromPublicKey as jest.Mock).mockReturnValue(mockKeypair);
+      (StrKey.isValidEd25519PublicKey as jest.Mock).mockReturnValue(true);
+
+      // First call: both SELECT and CLAIM succeed
+      mockFrom.mockImplementation((table: string) => {
+        if (table === 'nonces') {
+          const builder: Record<string, jest.Mock> = {
+            select: jest.fn(),
+            eq: jest.fn(),
+            is: jest.fn(),
+            single: jest.fn().mockResolvedValue({ data: defaultNonceRecord, error: null }),
+            update: jest.fn(),
+          };
+          let op: 'select' | 'update' = 'select';
+          builder.select.mockImplementation((..._args: unknown[]) => {
+            if (op === 'update') return Promise.resolve({ data: [{ id: 'nonce-uuid' }], error: null, count: 1 });
+            return builder;
+          });
+          builder.update.mockImplementation(() => {
+            op = 'update';
+            return builder;
+          });
+          builder.eq.mockReturnValue(builder);
+          builder.is.mockReturnValue(builder);
+          return builder;
+        }
+        return { insert: mockInsert };
+      });
+
+      await expect(service.verifySignature(validDto)).resolves.toBeUndefined();
+
+      // Second call: nonce already used — SELECT returns no rows (or CLAIM count 0)
+      mockFrom.mockImplementation((table: string) => {
+        if (table === 'nonces') {
+          const builder: Record<string, jest.Mock> = {
+            select: jest.fn(),
+            eq: jest.fn(),
+            is: jest.fn(),
+            single: jest.fn().mockResolvedValue({ data: null, error: { message: 'No rows found' } }),
+            update: jest.fn(),
+          };
+          builder.select.mockReturnValue(builder);
+          builder.eq.mockReturnValue(builder);
+          builder.is.mockReturnValue(builder);
+          builder.update.mockReturnValue(builder);
+          return builder;
+        }
+        return { insert: mockInsert };
+      });
+
+      await expect(service.verifySignature(validDto)).rejects.toMatchObject({
+        response: { code: 'AUTH_NONCE_NOT_FOUND' },
+      });
+    });
+
+    it('replay during failure burns the nonce (invalid signature leaves it consumed)', async () => {
+      const mockKeypair = { verify: jest.fn().mockReturnValue(false) };
+      (Keypair.fromPublicKey as jest.Mock).mockReturnValue(mockKeypair);
+      (StrKey.isValidEd25519PublicKey as jest.Mock).mockReturnValue(true);
+
+      let firstClaim = true;
+      mockFrom.mockImplementation((table: string) => {
+        if (table === 'nonces') {
+          const builder: Record<string, jest.Mock> = {
+            select: jest.fn(),
+            eq: jest.fn(),
+            is: jest.fn(),
+            single: jest.fn().mockResolvedValue({ data: defaultNonceRecord, error: null }),
+            update: jest.fn(),
+          };
+          let op: 'select' | 'update' = 'select';
+          builder.select.mockImplementation((..._args: unknown[]) => {
+            if (op === 'update') {
+              if (firstClaim) {
+                firstClaim = false;
+                return Promise.resolve({ data: [{ id: 'nonce-uuid' }], error: null, count: 1 });
+              }
+              return Promise.resolve({ data: [], error: null, count: 0 });
+            }
+            return builder;
+          });
+          builder.update.mockImplementation(() => {
+            op = 'update';
+            return builder;
+          });
+          builder.eq.mockReturnValue(builder);
+          builder.is.mockReturnValue(builder);
+          return builder;
+        }
+        return { insert: mockInsert };
+      });
+
+      await expect(service.verifySignature(validDto)).rejects.toMatchObject({
+        response: { code: 'AUTH_SIGNATURE_INVALID' },
+      });
+
+      // Even with a now-valid signature, replay should fail because nonce was burned
+      mockKeypair.verify.mockReturnValue(true);
+      await expect(service.verifySignature(validDto)).rejects.toMatchObject({
+        response: { code: 'AUTH_NONCE_NOT_FOUND' },
+      });
+    });
+
+    it('expired nonce is rejected and stays burned', async () => {
+      const expiredRecord = { id: 'nonce-uuid', expires_at: new Date(Date.now() - 1000).toISOString() };
+      const mockKeypair = { verify: jest.fn().mockReturnValue(true) };
+      (Keypair.fromPublicKey as jest.Mock).mockReturnValue(mockKeypair);
+      (StrKey.isValidEd25519PublicKey as jest.Mock).mockReturnValue(true);
+
+      let claimOnce = true;
+      mockFrom.mockImplementation((table: string) => {
+        if (table === 'nonces') {
+          const builder: Record<string, jest.Mock> = {
+            select: jest.fn(),
+            eq: jest.fn(),
+            is: jest.fn(),
+            single: jest.fn().mockResolvedValue({ data: expiredRecord, error: null }),
+            update: jest.fn(),
+          };
+          let op: 'select' | 'update' = 'select';
+          builder.select.mockImplementation((..._args: unknown[]) => {
+            if (op === 'update') {
+              if (claimOnce) {
+                claimOnce = false;
+                return Promise.resolve({ data: [{ id: 'nonce-uuid' }], error: null, count: 1 });
+              }
+              return Promise.resolve({ data: [], error: null, count: 0 });
+            }
+            return builder;
+          });
+          builder.update.mockImplementation(() => {
+            op = 'update';
+            return builder;
+          });
+          builder.eq.mockReturnValue(builder);
+          builder.is.mockReturnValue(builder);
+          return builder;
+        }
+        return { insert: mockInsert };
+      });
+
+      await expect(service.verifySignature(validDto)).rejects.toMatchObject({
+        response: { code: 'AUTH_NONCE_EXPIRED' },
+      });
+
+      // Second attempt should be NOT_FOUND because expired nonce was consumed
+      await expect(service.verifySignature(validDto)).rejects.toMatchObject({
+        response: { code: 'AUTH_NONCE_NOT_FOUND' },
+      });
     });
   });
 

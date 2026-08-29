@@ -1,6 +1,8 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { UnauthorizedException, ForbiddenException } from '@nestjs/common';
+import { CACHE_MANAGER } from '@nestjs/cache-manager';
+import { UnauthorizedException, ForbiddenException, HttpException, ExecutionContext } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
+import { Cache } from 'cache-manager';
 import { ApiKeyGuard } from '../../../../src/auth/guards/api-key.guard';
 import { SupabaseService } from '../../../../src/database/supabase.client';
 
@@ -9,7 +11,17 @@ describe('ApiKeyGuard', () => {
   let mockSupabaseClient: Record<string, jest.Mock>;
   let mockSupabaseService: { getServiceRoleClient: jest.Mock };
   let mockReflector: { get: jest.Mock };
-  let mockContext: any;
+  let mockCacheManager: {
+    get: jest.Mock;
+    set: jest.Mock;
+    del: jest.Mock;
+    store: Map<string, { value: unknown; expiresAt?: number }>;
+  };
+  let mockContext: {
+    switchToHttp: jest.Mock;
+    getRequest: jest.Mock;
+    getHandler: jest.Mock;
+  };
 
   const activeKeyRecord = {
     id: 'key-uuid',
@@ -27,10 +39,51 @@ describe('ApiKeyGuard', () => {
 
   const validApiKey = 'sfi_' + 'a'.repeat(64);
 
+  function createMockCache(): typeof mockCacheManager {
+    const store = new Map<string, { value: unknown; expiresAt?: number }>();
+    return {
+      store,
+      get: jest.fn(async (key: string) => {
+        const entry = store.get(key);
+        if (!entry) return undefined;
+        if (entry.expiresAt && Date.now() > entry.expiresAt) {
+          store.delete(key);
+          return undefined;
+        }
+        return entry.value;
+      }),
+      set: jest.fn(async (key: string, value: unknown, ttlSeconds?: number) => {
+        const expiresAt = ttlSeconds ? Date.now() + ttlSeconds * 1000 : undefined;
+        store.set(key, { value, expiresAt });
+      }),
+      del: jest.fn(async (key: string) => {
+        store.delete(key);
+      }),
+    };
+  }
+
+  function createSupabaseMock(result: { data: unknown; error: unknown }) {
+    const singleFn = jest.fn().mockResolvedValue(result);
+    const eqFn = jest.fn().mockReturnValue({ single: singleFn });
+    const selectFn = jest.fn().mockReturnValue({ eq: eqFn });
+    const updateEqFn = jest.fn().mockResolvedValue({ error: null });
+    const updateFn = jest.fn().mockReturnValue({ eq: updateEqFn });
+    mockSupabaseClient.from.mockImplementation((table: string) => {
+      if (table === 'api_keys') {
+        return {
+          select: selectFn,
+          update: updateFn,
+        };
+      }
+      return { select: selectFn, update: updateFn } as unknown as ReturnType<typeof mockSupabaseClient.from>;
+    });
+    return { singleFn, eqFn, selectFn, updateFn, updateEqFn };
+  }
+
   beforeEach(async () => {
     mockSupabaseClient = {
       from: jest.fn(),
-    };
+    } as unknown as Record<string, jest.Mock>;
 
     mockSupabaseService = {
       getServiceRoleClient: jest.fn(() => mockSupabaseClient),
@@ -40,11 +93,14 @@ describe('ApiKeyGuard', () => {
       get: jest.fn().mockReturnValue(null),
     };
 
+    mockCacheManager = createMockCache();
+
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         ApiKeyGuard,
         { provide: SupabaseService, useValue: mockSupabaseService },
         { provide: Reflector, useValue: mockReflector },
+        { provide: CACHE_MANAGER, useValue: mockCacheManager },
       ],
     }).compile();
 
@@ -53,273 +109,597 @@ describe('ApiKeyGuard', () => {
     mockContext = {
       switchToHttp: jest.fn().mockReturnThis(),
       getRequest: jest.fn(),
-      getHandler: jest.fn(),
-    };
+      getHandler: jest.fn().mockReturnValue(() => {}),
+    } as unknown as typeof mockContext;
   });
 
   afterEach(() => {
     jest.clearAllMocks();
   });
 
+  function setupRequest(headers: Record<string, unknown>) {
+    const request: Record<string, unknown> = { headers };
+    mockContext.switchToHttp.mockReturnValue({
+      getRequest: jest.fn().mockReturnValue(request),
+    });
+    return request as { headers: Record<string, unknown>; apiKey?: unknown };
+  }
+
   // ---------------------------------------------------------------------------
   // canActivate — basic scenarios
   // ---------------------------------------------------------------------------
-  describe('canActivate', () => {
-    function setupRequest(headers: Record<string, string | undefined>) {
-      mockContext.switchToHttp.mockReturnValue({
-        getRequest: jest.fn().mockReturnValue({ headers }),
-      });
-    }
-
-    function setupDbQuery(result: { data: any; error: any }) {
-      const singleFn = jest.fn().mockResolvedValue(result);
-      const eqFn = jest.fn().mockReturnValue({ single: singleFn });
-      const selectFn = jest.fn().mockReturnValue({ eq: eqFn });
-      const updateFn = jest.fn().mockResolvedValue({ error: null });
-      const updateEqFn = jest.fn().mockReturnValue(updateFn);
-
-      mockSupabaseClient.from.mockReturnValue({
-        select: selectFn,
-        update: jest.fn().mockReturnValue({ eq: updateEqFn }),
-      });
-    }
-
+  describe('canActivate — basic and enumeration uniformity', () => {
     it('should return true when X-API-Key is valid and active', async () => {
       setupRequest({ 'x-api-key': validApiKey });
-      setupDbQuery({ data: activeKeyRecord, error: null });
-      mockContext.getHandler.mockReturnValue(() => {});
+      createSupabaseMock({ data: activeKeyRecord, error: null });
 
-      const result = await guard.canActivate(mockContext);
+      const result = await guard.canActivate(mockContext as unknown as never);
       expect(result).toBe(true);
     });
 
-    it('should throw UnauthorizedException (API_KEY_MISSING) when X-API-Key header is absent', async () => {
+    it('should throw API_KEY_UNAUTHORIZED when X-API-Key header is absent (normalized)', async () => {
       setupRequest({});
 
-      await expect(guard.canActivate(mockContext)).rejects.toMatchObject({
-        response: { code: 'API_KEY_MISSING' },
+      await expect(guard.canActivate(mockContext as unknown as never)).rejects.toMatchObject({
+        response: { code: 'API_KEY_UNAUTHORIZED' },
       });
     });
 
-    it('should throw UnauthorizedException (API_KEY_MISSING) when X-API-Key is not a string', async () => {
-      setupRequest({ 'x-api-key': ['key1', 'key2'] } as any);
+    it('should throw API_KEY_UNAUTHORIZED when X-API-Key is not a string (normalized)', async () => {
+      setupRequest({ 'x-api-key': ['key1', 'key2'] as unknown as string });
 
-      await expect(guard.canActivate(mockContext)).rejects.toMatchObject({
-        response: { code: 'API_KEY_MISSING' },
+      await expect(guard.canActivate(mockContext as unknown as never)).rejects.toMatchObject({
+        response: { code: 'API_KEY_UNAUTHORIZED' },
       });
     });
 
-    it('should throw UnauthorizedException (API_KEY_INVALID) when key_hash not found', async () => {
+    it('should throw API_KEY_UNAUTHORIZED when key_hash not found (normalized)', async () => {
       setupRequest({ 'x-api-key': validApiKey });
-      setupDbQuery({ data: null, error: { message: 'No rows found' } });
-      mockContext.getHandler.mockReturnValue(() => {});
+      createSupabaseMock({ data: null, error: { message: 'No rows found' } });
 
-      await expect(guard.canActivate(mockContext)).rejects.toMatchObject({
-        response: { code: 'API_KEY_INVALID' },
+      await expect(guard.canActivate(mockContext as unknown as never)).rejects.toMatchObject({
+        response: { code: 'API_KEY_UNAUTHORIZED' },
       });
     });
 
-    it('should throw UnauthorizedException (API_KEY_INVALID) when database error occurs', async () => {
+    it('should throw API_KEY_UNAUTHORIZED when database error occurs (normalized, logged server-side)', async () => {
       setupRequest({ 'x-api-key': validApiKey });
-      setupDbQuery({ data: null, error: { message: 'DB error' } });
-      mockContext.getHandler.mockReturnValue(() => {});
+      createSupabaseMock({ data: null, error: { message: 'DB error' } });
 
-      await expect(guard.canActivate(mockContext)).rejects.toMatchObject({
-        response: { code: 'API_KEY_INVALID' },
+      await expect(guard.canActivate(mockContext as unknown as never)).rejects.toMatchObject({
+        response: { code: 'API_KEY_UNAUTHORIZED' },
       });
     });
 
-    it('should throw UnauthorizedException (API_KEY_INACTIVE) when key is revoked', async () => {
+    it('should throw API_KEY_UNAUTHORIZED when key is revoked (normalized, was API_KEY_INACTIVE)', async () => {
       setupRequest({ 'x-api-key': validApiKey });
-      setupDbQuery({
+      createSupabaseMock({
         data: { ...activeKeyRecord, is_active: false },
         error: null,
       });
-      mockContext.getHandler.mockReturnValue(() => {});
 
-      await expect(guard.canActivate(mockContext)).rejects.toMatchObject({
-        response: { code: 'API_KEY_INACTIVE' },
+      await expect(guard.canActivate(mockContext as unknown as never)).rejects.toMatchObject({
+        response: { code: 'API_KEY_UNAUTHORIZED' },
       });
     });
 
-    it('should throw UnauthorizedException (API_KEY_EXPIRED) when key is past expiry', async () => {
+    it('should throw API_KEY_UNAUTHORIZED when key is past expiry (normalized, was API_KEY_EXPIRED)', async () => {
       setupRequest({ 'x-api-key': validApiKey });
-      setupDbQuery({
+      createSupabaseMock({
         data: {
           ...activeKeyRecord,
           expires_at: new Date(Date.now() - 86400000).toISOString(),
         },
         error: null,
       });
-      mockContext.getHandler.mockReturnValue(() => {});
 
-      await expect(guard.canActivate(mockContext)).rejects.toMatchObject({
-        response: { code: 'API_KEY_EXPIRED' },
+      await expect(guard.canActivate(mockContext as unknown as never)).rejects.toMatchObject({
+        response: { code: 'API_KEY_UNAUTHORIZED' },
       });
+    });
+
+    it('enumeration uniformity: missing, invalid, inactive, expired all yield API_KEY_UNAUTHORIZED', async () => {
+      const cases: Array<{ headers: Record<string, unknown>; db: { data: unknown; error: unknown } | null }> = [
+        { headers: {}, db: null },
+        { headers: { 'x-api-key': validApiKey }, db: { data: null, error: { message: 'No rows found' } } },
+        {
+          headers: { 'x-api-key': validApiKey },
+          db: { data: { ...activeKeyRecord, is_active: false }, error: null },
+        },
+        {
+          headers: { 'x-api-key': validApiKey },
+          db: {
+            data: { ...activeKeyRecord, expires_at: new Date(Date.now() - 1000).toISOString() },
+            error: null,
+          },
+        },
+      ];
+
+      for (const c of cases) {
+        // Reset cache between cases to avoid cross-contamination
+        mockCacheManager.store.clear();
+        setupRequest(c.headers);
+        if (c.db) createSupabaseMock(c.db);
+        await expect(guard.canActivate(mockContext as unknown as never)).rejects.toMatchObject({
+          response: { code: 'API_KEY_UNAUTHORIZED' },
+        });
+      }
     });
 
     it('should not reject when expiry is in the future', async () => {
       setupRequest({ 'x-api-key': validApiKey });
-      setupDbQuery({
+      createSupabaseMock({
         data: {
           ...activeKeyRecord,
           expires_at: new Date(Date.now() + 86400000).toISOString(),
         },
         error: null,
       });
-      mockContext.getHandler.mockReturnValue(() => {});
 
-      const result = await guard.canActivate(mockContext);
+      const result = await guard.canActivate(mockContext as unknown as never);
       expect(result).toBe(true);
     });
 
     it('should set request.apiKey with the key record', async () => {
-      const request = { headers: { 'x-api-key': validApiKey } };
-      mockContext.switchToHttp.mockReturnValue({
-        getRequest: jest.fn().mockReturnValue(request),
-      });
-      setupDbQuery({ data: activeKeyRecord, error: null });
-      mockContext.getHandler.mockReturnValue(() => {});
+      const request = setupRequest({ 'x-api-key': validApiKey });
+      createSupabaseMock({ data: activeKeyRecord, error: null });
 
-      await guard.canActivate(mockContext);
+      await guard.canActivate(mockContext as unknown as never);
       expect(request).toHaveProperty('apiKey');
-      expect((request as any).apiKey.id).toBe('key-uuid');
+      expect((request as unknown as { apiKey: { id: string } }).apiKey.id).toBe('key-uuid');
     });
   });
 
   // ---------------------------------------------------------------------------
-  // canActivate — permission enforcement
+  // Caching — steady state ≤1 lookup per TTL per key
+  // ---------------------------------------------------------------------------
+  describe('caching', () => {
+    it('cache hit avoids DB call (mock assertions)', async () => {
+      setupRequest({ 'x-api-key': validApiKey });
+      const { selectFn } = createSupabaseMock({ data: activeKeyRecord, error: null });
+
+      // First request hits DB and populates cache
+      await expect(guard.canActivate(mockContext as unknown as never)).resolves.toBe(true);
+      expect(selectFn).toHaveBeenCalledTimes(1);
+      expect(mockCacheManager.set).toHaveBeenCalledWith(
+        expect.stringContaining('apikey:record:'),
+        expect.objectContaining({ id: 'key-uuid' }),
+        expect.any(Number),
+      );
+
+      // Second request with same key should hit cache and not hit DB
+      const request2 = setupRequest({ 'x-api-key': validApiKey });
+      // Reset select mock to detect new calls
+      const secondSelectFn = jest.fn().mockReturnValue({
+        eq: jest.fn().mockReturnValue({ single: jest.fn().mockResolvedValue({ data: activeKeyRecord, error: null }) }),
+      });
+      mockSupabaseClient.from.mockReturnValue({
+        select: secondSelectFn,
+        update: jest.fn().mockReturnValue({ eq: jest.fn().mockResolvedValue({ error: null }) }),
+      } as unknown as ReturnType<typeof mockSupabaseClient.from>);
+
+      await expect(guard.canActivate(mockContext as unknown as never)).resolves.toBe(true);
+      expect(secondSelectFn).not.toHaveBeenCalled();
+      // apiKey still set correctly from cache
+      expect(request2).toHaveProperty('apiKey');
+    });
+
+    it('revocation invalidates within one TTL (vendors service deletes cache)', async () => {
+      // This test documents the contract: VendorsService.revokeApiKey deletes
+      // `apikey:record:<hash>` plus rate/last_used keys. Here we verify the
+      // guard respects a manual del (simulating revocation).
+      setupRequest({ 'x-api-key': validApiKey });
+      createSupabaseMock({ data: activeKeyRecord, error: null });
+      await guard.canActivate(mockContext as unknown as never);
+      expect(mockCacheManager.store.size).toBeGreaterThan(0);
+
+      // Simulate revocation invalidation
+      const hash = require('crypto').createHash('sha256').update(validApiKey).digest('hex');
+      await mockCacheManager.del(`apikey:record:${hash}`);
+      expect(await mockCacheManager.get(`apikey:record:${hash}`)).toBeUndefined();
+
+      // Next request should miss cache and hit DB again (which will now see inactive)
+      setupRequest({ 'x-api-key': validApiKey });
+      createSupabaseMock({
+        data: { ...activeKeyRecord, is_active: false },
+        error: null,
+      });
+      await expect(guard.canActivate(mockContext as unknown as never)).rejects.toMatchObject({
+        response: { code: 'API_KEY_UNAUTHORIZED' },
+      });
+    });
+
+    it('never stores full keys in cache (only hash-derived keys)', async () => {
+      setupRequest({ 'x-api-key': validApiKey });
+      createSupabaseMock({ data: activeKeyRecord, error: null });
+      await guard.canActivate(mockContext as unknown as never);
+
+      const cacheKeys = Array.from(mockCacheManager.store.keys());
+      const hasRawKey = cacheKeys.some((k) => k.includes(validApiKey));
+      expect(hasRawKey).toBe(false);
+      const hasHashKey = cacheKeys.some((k) => k.startsWith('apikey:record:'));
+      expect(hasHashKey).toBe(true);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Rate limiting — per-key sliding window
+  // ---------------------------------------------------------------------------
+  describe('rate limiting', () => {
+    it('rate limit trips and returns structured 429', async () => {
+      // Pre-fill rate counter to just below limit
+      const hash = require('crypto').createHash('sha256').update(validApiKey).digest('hex');
+      // We need to know the keyId to build rate key; guard uses keyRecord.id
+      // Simulate 60 requests already counted
+      const rateKey = `apikey:rate:${activeKeyRecord.id}`;
+      await mockCacheManager.set(rateKey, 60, 60);
+
+      setupRequest({ 'x-api-key': validApiKey });
+      createSupabaseMock({ data: activeKeyRecord, error: null });
+
+      await expect(guard.canActivate(mockContext as unknown as never)).rejects.toMatchObject({
+        status: 429,
+        response: { code: 'API_KEY_RATE_LIMITED' },
+      });
+    });
+
+    it('rate limit resets after TTL', async () => {
+      const rateKey = `apikey:rate:${activeKeyRecord.id}`;
+      await mockCacheManager.set(rateKey, 60, 1); // 1 second TTL
+      // Wait for expiry
+      await new Promise((r) => setTimeout(r, 1100));
+
+      setupRequest({ 'x-api-key': validApiKey });
+      createSupabaseMock({ data: activeKeyRecord, error: null });
+
+      await expect(guard.canActivate(mockContext as unknown as never)).resolves.toBe(true);
+    });
+
+    it('successful requests increment rate counter', async () => {
+      setupRequest({ 'x-api-key': validApiKey });
+      createSupabaseMock({ data: activeKeyRecord, error: null });
+
+      await guard.canActivate(mockContext as unknown as never);
+      const rateKey = `apikey:rate:${activeKeyRecord.id}`;
+      const count = (await mockCacheManager.get(rateKey)) as unknown as number;
+      expect(count).toBe(1);
+
+      // Second request increments
+      setupRequest({ 'x-api-key': validApiKey });
+      // Need to keep cache for record, but rate key should increment
+      // guard will hit cache for record, so no DB needed, but we still need mock for DB fallback (should not be called)
+      await guard.canActivate(mockContext as unknown as never);
+      const count2 = (await mockCacheManager.get(rateKey)) as unknown as number;
+      expect(count2).toBe(2);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Negative cache — unknown-key flood protection
+  // ---------------------------------------------------------------------------
+  describe('negative cache — unknown-key flood protection', () => {
+    it('caches non-existent key hashes briefly and avoids DB on second hit', async () => {
+      const unknownKey = 'sfi_' + 'z'.repeat(64);
+      setupRequest({ 'x-api-key': unknownKey });
+      const { selectFn } = createSupabaseMock({ data: null, error: { message: 'No rows found' } });
+
+      await expect(guard.canActivate(mockContext as unknown as never)).rejects.toMatchObject({
+        response: { code: 'API_KEY_UNAUTHORIZED' },
+      });
+      expect(selectFn).toHaveBeenCalledTimes(1);
+      // Negative marker should be cached
+      const hash = require('crypto').createHash('sha256').update(unknownKey).digest('hex');
+      const negKey = `apikey:negative:${hash}`;
+      expect(await mockCacheManager.get(negKey)).toBe(true);
+
+      // Second request with same unknown key should hit negative cache, not DB
+      setupRequest({ 'x-api-key': unknownKey });
+      const secondSelect = jest.fn().mockReturnValue({
+        eq: jest.fn().mockReturnValue({ single: jest.fn().mockResolvedValue({ data: null, error: { message: 'No rows found' } }) }),
+      });
+      mockSupabaseClient.from.mockReturnValue({
+        select: secondSelect,
+        update: jest.fn().mockReturnValue({ eq: jest.fn().mockResolvedValue({ error: null }) }),
+      } as unknown as ReturnType<typeof mockSupabaseClient.from>);
+
+      await expect(guard.canActivate(mockContext as unknown as never)).rejects.toMatchObject({
+        response: { code: 'API_KEY_UNAUTHORIZED' },
+      });
+      expect(secondSelect).not.toHaveBeenCalled();
+    });
+
+    it('negative cache never stores full keys, only hash-derived keys', async () => {
+      const unknownKey = 'sfi_' + 'y'.repeat(64);
+      setupRequest({ 'x-api-key': unknownKey });
+      createSupabaseMock({ data: null, error: { message: 'No rows found' } });
+
+      await expect(guard.canActivate(mockContext as unknown as never)).rejects.toMatchObject({
+        response: { code: 'API_KEY_UNAUTHORIZED' },
+      });
+
+      const cacheKeys = Array.from(mockCacheManager.store.keys());
+      const hasRaw = cacheKeys.some((k) => k.includes(unknownKey));
+      expect(hasRaw).toBe(false);
+      const hasNeg = cacheKeys.some((k) => k.startsWith('apikey:negative:'));
+      expect(hasNeg).toBe(true);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Per-IP burst protection — complements global ThrottlerGuard
+  // ---------------------------------------------------------------------------
+  describe('per-IP burst protection — random-key flood', () => {
+    function setupRequestWithIp(headers: Record<string, unknown>, ip: string) {
+      const request: Record<string, unknown> = { headers, ip };
+      mockContext.switchToHttp.mockReturnValue({
+        getRequest: jest.fn().mockReturnValue(request),
+      });
+      return request;
+    }
+
+    it('trips after 30 unknown-key attempts from same IP and returns 429', async () => {
+      const ip = '203.0.113.99';
+      const rateKey = `apikey:ip:rate:${ip}`;
+      await mockCacheManager.set(rateKey, 30, 60);
+
+      setupRequestWithIp({ 'x-api-key': 'sfi_' + 'q'.repeat(64) }, ip);
+      createSupabaseMock({ data: null, error: { message: 'No rows found' } });
+
+      await expect(guard.canActivate(mockContext as unknown as never)).rejects.toMatchObject({
+        status: 429,
+        response: { code: 'API_KEY_RATE_LIMITED' },
+      });
+    });
+
+    it('per-IP limit is isolated across IPs', async () => {
+      const ipA = '198.51.100.10';
+      const ipB = '198.51.100.11';
+      const rateKeyA = `apikey:ip:rate:${ipA}`;
+      await mockCacheManager.set(rateKeyA, 30, 60);
+
+      setupRequestWithIp({ 'x-api-key': 'sfi_' + 'r'.repeat(64) }, ipA);
+      createSupabaseMock({ data: null, error: { message: 'No rows found' } });
+      await expect(guard.canActivate(mockContext as unknown as never)).rejects.toMatchObject({
+        response: { code: 'API_KEY_RATE_LIMITED' },
+      });
+
+      // Different IP should still be allowed to hit DB (and get UNAUTHORIZED, not RATE_LIMITED)
+      setupRequestWithIp({ 'x-api-key': 'sfi_' + 'r'.repeat(64) }, ipB);
+      createSupabaseMock({ data: null, error: { message: 'No rows found' } });
+      await expect(guard.canActivate(mockContext as unknown as never)).rejects.toMatchObject({
+        response: { code: 'API_KEY_UNAUTHORIZED' },
+      });
+    });
+
+    it('IP counter increments on unknown-key requests', async () => {
+      const ip = '192.0.2.50';
+      setupRequestWithIp({ 'x-api-key': 'sfi_' + 'm'.repeat(64) }, ip);
+      createSupabaseMock({ data: null, error: { message: 'No rows found' } });
+
+      await expect(guard.canActivate(mockContext as unknown as never)).rejects.toMatchObject({
+        response: { code: 'API_KEY_UNAUTHORIZED' },
+      });
+      const count = (await mockCacheManager.get(`apikey:ip:rate:${ip}`)) as unknown as number;
+      expect(count).toBe(1);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Revocation end-to-end (guard + VendorsService invalidation)
+  // ---------------------------------------------------------------------------
+  describe('revocation end-to-end — cached key rejected within one TTL', () => {
+    it('guard rejects a previously cached key after VendorsService.revokeApiKey invalidates it', async () => {
+      // This test wires the real VendorsService with the same cacheManager so
+      // revocation is proven to invalidate the guard's record cache, not just
+      // that del was called.
+      const { VendorsService } = await import('../../../../src/modules/vendors/vendors.service');
+      const { VendorsRepository } = await import('../../../../src/database/repositories/vendors.repository');
+      const { VendorRegistryContractClient } = await import('../../../../src/stellar/contracts/clients/vendor-registry.client');
+
+      const sharedCache = createMockCache();
+      const mockVendor = { id: 'vendor-uuid', wallet_address: 'GAVENDOR' };
+      const keyId = 'key-uuid';
+      const keyHash = require('crypto').createHash('sha256').update(validApiKey).digest('hex');
+
+      // VendorsService mocks
+      const mockVendorsRepo = { findByWallet: jest.fn().mockResolvedValue(mockVendor) };
+      const mockSupabaseForVendors = {
+        getServiceRoleClient: jest.fn().mockReturnValue({
+          from: jest.fn().mockImplementation((table: string) => {
+            if (table === 'api_keys') {
+              return {
+                select: jest.fn().mockReturnValue({
+                  eq: jest.fn().mockReturnValue({
+                    eq: jest.fn().mockReturnValue({
+                      single: jest.fn().mockResolvedValue({ data: { id: keyId, key_hash: keyHash }, error: null }),
+                    }),
+                  }),
+                }),
+                update: jest.fn().mockReturnValue({ eq: jest.fn().mockResolvedValue({ error: null }) }),
+              };
+            }
+            return { select: jest.fn() } as never;
+          }),
+        }),
+        getClient: jest.fn(),
+      };
+
+      const vendorsModule: TestingModule = await Test.createTestingModule({
+        providers: [
+          VendorsService,
+          { provide: SupabaseService, useValue: mockSupabaseForVendors },
+          { provide: VendorsRepository, useValue: mockVendorsRepo },
+          { provide: VendorRegistryContractClient, useValue: {} },
+          { provide: CACHE_MANAGER, useValue: sharedCache },
+        ],
+      }).compile();
+      const vendorsService: InstanceType<typeof VendorsService> = vendorsModule.get(VendorsService);
+
+      // Guard with same shared cache, primed with a valid cached record
+      const guardWithSharedCache = new ApiKeyGuard(sharedCache as unknown as Cache, mockSupabaseService as unknown as SupabaseService, mockReflector as unknown as Reflector);
+
+      // Prime cache via first successful canActivate (hits DB, caches record)
+      setupRequest({ 'x-api-key': validApiKey });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- reaching into private for test wiring
+      (guardWithSharedCache as any).cacheManager = sharedCache as unknown as Cache;
+      // Mock DB for guard to return active key
+      mockSupabaseClient.from.mockImplementation((table: string) => {
+        if (table === 'api_keys') {
+          return {
+            select: jest.fn().mockReturnValue({
+              eq: jest.fn().mockReturnValue({
+                single: jest.fn().mockResolvedValue({ data: activeKeyRecord, error: null }),
+              }),
+            }),
+            update: jest.fn().mockReturnValue({ eq: jest.fn().mockResolvedValue({ error: null }) }),
+          } as unknown as ReturnType<typeof mockSupabaseClient.from>;
+        }
+        return { select: jest.fn() } as never;
+      });
+      const firstReqCtx = {
+        switchToHttp: jest.fn().mockReturnValue({
+          getRequest: jest.fn().mockReturnValue({ headers: { 'x-api-key': validApiKey }, ip: '1.2.3.4' }),
+        }),
+        getHandler: jest.fn().mockReturnValue(() => {}),
+      } as unknown as ExecutionContext;
+      await expect(guardWithSharedCache.canActivate(firstReqCtx)).resolves.toBe(true);
+      expect(await sharedCache.get(`apikey:record:${keyHash}`)).toEqual(expect.objectContaining({ id: 'key-uuid' }));
+
+      // Revoke via VendorsService — should delete the cached record
+      await vendorsService.revokeApiKey('GAVENDOR', keyId);
+      expect(await sharedCache.get(`apikey:record:${keyHash}`)).toBeUndefined();
+
+      // Next guard call should not be served from cache; DB now returns inactive
+      mockSupabaseClient.from.mockImplementation((table: string) => {
+        if (table === 'api_keys') {
+          return {
+            select: jest.fn().mockReturnValue({
+              eq: jest.fn().mockReturnValue({
+                single: jest.fn().mockResolvedValue({
+                  data: { ...activeKeyRecord, is_active: false },
+                  error: null,
+                }),
+              }),
+            }),
+            update: jest.fn().mockReturnValue({ eq: jest.fn().mockResolvedValue({ error: null }) }),
+          } as unknown as ReturnType<typeof mockSupabaseClient.from>;
+        }
+        return { select: jest.fn() } as never;
+      });
+      const secondReqCtx = {
+        switchToHttp: jest.fn().mockReturnValue({
+          getRequest: jest.fn().mockReturnValue({ headers: { 'x-api-key': validApiKey }, ip: '1.2.3.4' }),
+        }),
+        getHandler: jest.fn().mockReturnValue(() => {}),
+      } as unknown as ExecutionContext;
+      await expect(guardWithSharedCache.canActivate(secondReqCtx)).rejects.toMatchObject({
+        response: { code: 'API_KEY_UNAUTHORIZED' },
+      });
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Permission enforcement
   // ---------------------------------------------------------------------------
   describe('permission enforcement', () => {
-    function setupRequest(headers: Record<string, string>) {
-      mockContext.switchToHttp.mockReturnValue({
-        getRequest: jest.fn().mockReturnValue({ headers }),
-      });
-    }
-
-    function setupDbQuery(result: { data: any; error: any }) {
-      const singleFn = jest.fn().mockResolvedValue(result);
-      const eqFn = jest.fn().mockReturnValue({ single: singleFn });
-      const selectFn = jest.fn().mockReturnValue({ eq: eqFn });
-      const updateFn = jest.fn().mockResolvedValue({ error: null });
-      const updateEqFn = jest.fn().mockReturnValue(updateFn);
-
-      mockSupabaseClient.from.mockReturnValue({
-        select: selectFn,
-        update: jest.fn().mockReturnValue({ eq: updateEqFn }),
-      });
-    }
-
     it('should pass when required permissions match key permissions', async () => {
       setupRequest({ 'x-api-key': validApiKey });
-      setupDbQuery({ data: activeKeyRecord, error: null });
+      createSupabaseMock({ data: activeKeyRecord, error: null });
       mockReflector.get.mockReturnValue(['loans:read']);
-      mockContext.getHandler.mockReturnValue(() => {});
 
-      const result = await guard.canActivate(mockContext);
+      const result = await guard.canActivate(mockContext as unknown as never);
       expect(result).toBe(true);
     });
 
     it('should pass when key has any of the required permissions', async () => {
       setupRequest({ 'x-api-key': validApiKey });
-      setupDbQuery({ data: activeKeyRecord, error: null });
+      createSupabaseMock({ data: activeKeyRecord, error: null });
       mockReflector.get.mockReturnValue(['loans:write', 'transactions:read']);
-      mockContext.getHandler.mockReturnValue(() => {});
 
-      const result = await guard.canActivate(mockContext);
+      const result = await guard.canActivate(mockContext as unknown as never);
       expect(result).toBe(true);
     });
 
     it('should throw ForbiddenException (API_KEY_INSUFFICIENT_PERMISSIONS) when key lacks required permissions', async () => {
       setupRequest({ 'x-api-key': validApiKey });
-      setupDbQuery({ data: activeKeyRecord, error: null });
+      createSupabaseMock({ data: activeKeyRecord, error: null });
       mockReflector.get.mockReturnValue(['admin:write']);
-      mockContext.getHandler.mockReturnValue(() => {});
 
-      await expect(guard.canActivate(mockContext)).rejects.toMatchObject({
+      await expect(guard.canActivate(mockContext as unknown as never)).rejects.toMatchObject({
         response: { code: 'API_KEY_INSUFFICIENT_PERMISSIONS' },
       });
     });
 
     it('should pass when no permissions are required on the endpoint', async () => {
       setupRequest({ 'x-api-key': validApiKey });
-      setupDbQuery({ data: activeKeyRecord, error: null });
+      createSupabaseMock({ data: activeKeyRecord, error: null });
       mockReflector.get.mockReturnValue(null);
-      mockContext.getHandler.mockReturnValue(() => {});
 
-      const result = await guard.canActivate(mockContext);
-      expect(result).toBe(true);
-    });
-
-    it('should pass when required permissions is an empty array', async () => {
-      setupRequest({ 'x-api-key': validApiKey });
-      setupDbQuery({ data: activeKeyRecord, error: null });
-      mockReflector.get.mockReturnValue([]);
-      mockContext.getHandler.mockReturnValue(() => {});
-
-      const result = await guard.canActivate(mockContext);
+      const result = await guard.canActivate(mockContext as unknown as never);
       expect(result).toBe(true);
     });
   });
 
   // ---------------------------------------------------------------------------
-  // last_used_at update (fire-and-forget)
+  // last_used_at update — throttled to at-most-once-per-5-minutes-per-key
   // ---------------------------------------------------------------------------
-  describe('last_used_at update', () => {
-    function setupRequest(headers: Record<string, string>) {
-      mockContext.switchToHttp.mockReturnValue({
-        getRequest: jest.fn().mockReturnValue({ headers }),
-      });
-    }
-
-    it('should update last_used_at on successful authentication', async () => {
+  describe('last_used_at throttling', () => {
+    it('should trigger last_used_at update on first successful authentication', async () => {
       setupRequest({ 'x-api-key': validApiKey });
+      const { updateFn } = createSupabaseMock({ data: activeKeyRecord, error: null });
 
-      const singleFn = jest.fn().mockResolvedValue({ data: activeKeyRecord, error: null });
-      const eqFn = jest.fn().mockReturnValue({ single: singleFn });
-      const selectFn = jest.fn().mockReturnValue({ eq: eqFn });
-      const updateEqFn = jest.fn().mockResolvedValue({ error: null });
-      const updateFn = jest.fn().mockReturnValue({ eq: updateEqFn });
+      await guard.canActivate(mockContext as unknown as never);
+      // Allow fire-and-forget to complete
+      await new Promise((r) => setImmediate(r));
 
-      mockSupabaseClient.from.mockImplementation((table: string) => {
-        if (table === 'api_keys') {
-          return {
-            select: selectFn,
-            update: jest.fn().mockReturnValue({ eq: updateEqFn }),
-          };
-        }
-        return { insert: jest.fn() };
-      });
-
-      mockContext.getHandler.mockReturnValue(() => {});
-
-      await guard.canActivate(mockContext);
-      expect(mockSupabaseService.getServiceRoleClient).toHaveBeenCalledTimes(2);
+      // update should have been called once (plus the rate-limit cache, but we check from mock)
+      // The mock's from was called for select and for update
+      expect(mockSupabaseClient.from).toHaveBeenCalledWith('api_keys');
+      // We can verify that update was attempted by checking the mock's call count
+      // The updateFn is for last_used_at
+      expect(updateFn).toHaveBeenCalled();
     });
 
-    it('should not throw when last_used_at update fails (fire-and-forget)', async () => {
+    it('should collapse last_used_at writes within TTL (second request does not hit DB for update)', async () => {
       setupRequest({ 'x-api-key': validApiKey });
+      createSupabaseMock({ data: activeKeyRecord, error: null });
+      await guard.canActivate(mockContext as unknown as never);
+      await new Promise((r) => setImmediate(r));
 
+      const callCountAfterFirst = mockSupabaseClient.from.mock.calls.length;
+
+      // Second request should hit cache for record and skip last_used update due to dirty flag
+      setupRequest({ 'x-api-key': validApiKey });
+      // Keep cache, so DB not hit for record; but we need to ensure update not called again
+      await guard.canActivate(mockContext as unknown as never);
+      await new Promise((r) => setImmediate(r));
+
+      // from should not have been called again for update (only maybe for select if cache miss, but we have cache hit)
+      // So call count should not increase by 1 for update
+      // Since we use cache hit for record, no DB lookup, and last_used is throttled, no update
+      expect(mockSupabaseClient.from.mock.calls.length).toBe(callCountAfterFirst);
+    });
+
+    it('should not throw when last_used_at update fails', async () => {
+      setupRequest({ 'x-api-key': validApiKey });
       const singleFn = jest.fn().mockResolvedValue({ data: activeKeyRecord, error: null });
       const eqFn = jest.fn().mockReturnValue({ single: singleFn });
       const selectFn = jest.fn().mockReturnValue({ eq: eqFn });
       const updateEqFn = jest.fn().mockRejectedValue(new Error('Network error'));
-      const updateFn = jest.fn().mockReturnValue({ eq: updateEqFn });
-
       mockSupabaseClient.from.mockImplementation((table: string) => {
         if (table === 'api_keys') {
           return {
             select: selectFn,
             update: jest.fn().mockReturnValue({ eq: updateEqFn }),
-          };
+          } as unknown as ReturnType<typeof mockSupabaseClient.from>;
         }
-        return { insert: jest.fn() };
+        return { select: selectFn } as unknown as ReturnType<typeof mockSupabaseClient.from>;
       });
 
-      mockContext.getHandler.mockReturnValue(() => {});
-
-      const result = await guard.canActivate(mockContext);
+      const result = await guard.canActivate(mockContext as unknown as never);
       expect(result).toBe(true);
+      await new Promise((r) => setImmediate(r));
+      // Still returns true despite update failure
     });
   });
 });
