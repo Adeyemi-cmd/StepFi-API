@@ -1,6 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { CACHE_MANAGER } from '@nestjs/cache-manager';
-import { UnauthorizedException, ForbiddenException, HttpException } from '@nestjs/common';
+import { UnauthorizedException, ForbiddenException, HttpException, ExecutionContext } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import { Cache } from 'cache-manager';
 import { ApiKeyGuard } from '../../../../src/auth/guards/api-key.guard';
@@ -371,6 +371,230 @@ describe('ApiKeyGuard', () => {
       await guard.canActivate(mockContext as unknown as never);
       const count2 = (await mockCacheManager.get(rateKey)) as unknown as number;
       expect(count2).toBe(2);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Negative cache — unknown-key flood protection
+  // ---------------------------------------------------------------------------
+  describe('negative cache — unknown-key flood protection', () => {
+    it('caches non-existent key hashes briefly and avoids DB on second hit', async () => {
+      const unknownKey = 'sfi_' + 'z'.repeat(64);
+      setupRequest({ 'x-api-key': unknownKey });
+      const { selectFn } = createSupabaseMock({ data: null, error: { message: 'No rows found' } });
+
+      await expect(guard.canActivate(mockContext as unknown as never)).rejects.toMatchObject({
+        response: { code: 'API_KEY_UNAUTHORIZED' },
+      });
+      expect(selectFn).toHaveBeenCalledTimes(1);
+      // Negative marker should be cached
+      const hash = require('crypto').createHash('sha256').update(unknownKey).digest('hex');
+      const negKey = `apikey:negative:${hash}`;
+      expect(await mockCacheManager.get(negKey)).toBe(true);
+
+      // Second request with same unknown key should hit negative cache, not DB
+      setupRequest({ 'x-api-key': unknownKey });
+      const secondSelect = jest.fn().mockReturnValue({
+        eq: jest.fn().mockReturnValue({ single: jest.fn().mockResolvedValue({ data: null, error: { message: 'No rows found' } }) }),
+      });
+      mockSupabaseClient.from.mockReturnValue({
+        select: secondSelect,
+        update: jest.fn().mockReturnValue({ eq: jest.fn().mockResolvedValue({ error: null }) }),
+      } as unknown as ReturnType<typeof mockSupabaseClient.from>);
+
+      await expect(guard.canActivate(mockContext as unknown as never)).rejects.toMatchObject({
+        response: { code: 'API_KEY_UNAUTHORIZED' },
+      });
+      expect(secondSelect).not.toHaveBeenCalled();
+    });
+
+    it('negative cache never stores full keys, only hash-derived keys', async () => {
+      const unknownKey = 'sfi_' + 'y'.repeat(64);
+      setupRequest({ 'x-api-key': unknownKey });
+      createSupabaseMock({ data: null, error: { message: 'No rows found' } });
+
+      await expect(guard.canActivate(mockContext as unknown as never)).rejects.toMatchObject({
+        response: { code: 'API_KEY_UNAUTHORIZED' },
+      });
+
+      const cacheKeys = Array.from(mockCacheManager.store.keys());
+      const hasRaw = cacheKeys.some((k) => k.includes(unknownKey));
+      expect(hasRaw).toBe(false);
+      const hasNeg = cacheKeys.some((k) => k.startsWith('apikey:negative:'));
+      expect(hasNeg).toBe(true);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Per-IP burst protection — complements global ThrottlerGuard
+  // ---------------------------------------------------------------------------
+  describe('per-IP burst protection — random-key flood', () => {
+    function setupRequestWithIp(headers: Record<string, unknown>, ip: string) {
+      const request: Record<string, unknown> = { headers, ip };
+      mockContext.switchToHttp.mockReturnValue({
+        getRequest: jest.fn().mockReturnValue(request),
+      });
+      return request;
+    }
+
+    it('trips after 30 unknown-key attempts from same IP and returns 429', async () => {
+      const ip = '203.0.113.99';
+      const rateKey = `apikey:ip:rate:${ip}`;
+      await mockCacheManager.set(rateKey, 30, 60);
+
+      setupRequestWithIp({ 'x-api-key': 'sfi_' + 'q'.repeat(64) }, ip);
+      createSupabaseMock({ data: null, error: { message: 'No rows found' } });
+
+      await expect(guard.canActivate(mockContext as unknown as never)).rejects.toMatchObject({
+        status: 429,
+        response: { code: 'API_KEY_RATE_LIMITED' },
+      });
+    });
+
+    it('per-IP limit is isolated across IPs', async () => {
+      const ipA = '198.51.100.10';
+      const ipB = '198.51.100.11';
+      const rateKeyA = `apikey:ip:rate:${ipA}`;
+      await mockCacheManager.set(rateKeyA, 30, 60);
+
+      setupRequestWithIp({ 'x-api-key': 'sfi_' + 'r'.repeat(64) }, ipA);
+      createSupabaseMock({ data: null, error: { message: 'No rows found' } });
+      await expect(guard.canActivate(mockContext as unknown as never)).rejects.toMatchObject({
+        response: { code: 'API_KEY_RATE_LIMITED' },
+      });
+
+      // Different IP should still be allowed to hit DB (and get UNAUTHORIZED, not RATE_LIMITED)
+      setupRequestWithIp({ 'x-api-key': 'sfi_' + 'r'.repeat(64) }, ipB);
+      createSupabaseMock({ data: null, error: { message: 'No rows found' } });
+      await expect(guard.canActivate(mockContext as unknown as never)).rejects.toMatchObject({
+        response: { code: 'API_KEY_UNAUTHORIZED' },
+      });
+    });
+
+    it('IP counter increments on unknown-key requests', async () => {
+      const ip = '192.0.2.50';
+      setupRequestWithIp({ 'x-api-key': 'sfi_' + 'm'.repeat(64) }, ip);
+      createSupabaseMock({ data: null, error: { message: 'No rows found' } });
+
+      await expect(guard.canActivate(mockContext as unknown as never)).rejects.toMatchObject({
+        response: { code: 'API_KEY_UNAUTHORIZED' },
+      });
+      const count = (await mockCacheManager.get(`apikey:ip:rate:${ip}`)) as unknown as number;
+      expect(count).toBe(1);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Revocation end-to-end (guard + VendorsService invalidation)
+  // ---------------------------------------------------------------------------
+  describe('revocation end-to-end — cached key rejected within one TTL', () => {
+    it('guard rejects a previously cached key after VendorsService.revokeApiKey invalidates it', async () => {
+      // This test wires the real VendorsService with the same cacheManager so
+      // revocation is proven to invalidate the guard's record cache, not just
+      // that del was called.
+      const { VendorsService } = await import('../../../../src/modules/vendors/vendors.service');
+      const { VendorsRepository } = await import('../../../../src/database/repositories/vendors.repository');
+      const { VendorRegistryContractClient } = await import('../../../../src/stellar/contracts/clients/vendor-registry.client');
+
+      const sharedCache = createMockCache();
+      const mockVendor = { id: 'vendor-uuid', wallet_address: 'GAVENDOR' };
+      const keyId = 'key-uuid';
+      const keyHash = require('crypto').createHash('sha256').update(validApiKey).digest('hex');
+
+      // VendorsService mocks
+      const mockVendorsRepo = { findByWallet: jest.fn().mockResolvedValue(mockVendor) };
+      const mockSupabaseForVendors = {
+        getServiceRoleClient: jest.fn().mockReturnValue({
+          from: jest.fn().mockImplementation((table: string) => {
+            if (table === 'api_keys') {
+              return {
+                select: jest.fn().mockReturnValue({
+                  eq: jest.fn().mockReturnValue({
+                    eq: jest.fn().mockReturnValue({
+                      single: jest.fn().mockResolvedValue({ data: { id: keyId, key_hash: keyHash }, error: null }),
+                    }),
+                  }),
+                }),
+                update: jest.fn().mockReturnValue({ eq: jest.fn().mockResolvedValue({ error: null }) }),
+              };
+            }
+            return { select: jest.fn() } as never;
+          }),
+        }),
+        getClient: jest.fn(),
+      };
+
+      const vendorsModule: TestingModule = await Test.createTestingModule({
+        providers: [
+          VendorsService,
+          { provide: SupabaseService, useValue: mockSupabaseForVendors },
+          { provide: VendorsRepository, useValue: mockVendorsRepo },
+          { provide: VendorRegistryContractClient, useValue: {} },
+          { provide: CACHE_MANAGER, useValue: sharedCache },
+        ],
+      }).compile();
+      const vendorsService: InstanceType<typeof VendorsService> = vendorsModule.get(VendorsService);
+
+      // Guard with same shared cache, primed with a valid cached record
+      const guardWithSharedCache = new ApiKeyGuard(sharedCache as unknown as Cache, mockSupabaseService as unknown as SupabaseService, mockReflector as unknown as Reflector);
+
+      // Prime cache via first successful canActivate (hits DB, caches record)
+      setupRequest({ 'x-api-key': validApiKey });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- reaching into private for test wiring
+      (guardWithSharedCache as any).cacheManager = sharedCache as unknown as Cache;
+      // Mock DB for guard to return active key
+      mockSupabaseClient.from.mockImplementation((table: string) => {
+        if (table === 'api_keys') {
+          return {
+            select: jest.fn().mockReturnValue({
+              eq: jest.fn().mockReturnValue({
+                single: jest.fn().mockResolvedValue({ data: activeKeyRecord, error: null }),
+              }),
+            }),
+            update: jest.fn().mockReturnValue({ eq: jest.fn().mockResolvedValue({ error: null }) }),
+          } as unknown as ReturnType<typeof mockSupabaseClient.from>;
+        }
+        return { select: jest.fn() } as never;
+      });
+      const firstReqCtx = {
+        switchToHttp: jest.fn().mockReturnValue({
+          getRequest: jest.fn().mockReturnValue({ headers: { 'x-api-key': validApiKey }, ip: '1.2.3.4' }),
+        }),
+        getHandler: jest.fn().mockReturnValue(() => {}),
+      } as unknown as ExecutionContext;
+      await expect(guardWithSharedCache.canActivate(firstReqCtx)).resolves.toBe(true);
+      expect(await sharedCache.get(`apikey:record:${keyHash}`)).toEqual(expect.objectContaining({ id: 'key-uuid' }));
+
+      // Revoke via VendorsService — should delete the cached record
+      await vendorsService.revokeApiKey('GAVENDOR', keyId);
+      expect(await sharedCache.get(`apikey:record:${keyHash}`)).toBeUndefined();
+
+      // Next guard call should not be served from cache; DB now returns inactive
+      mockSupabaseClient.from.mockImplementation((table: string) => {
+        if (table === 'api_keys') {
+          return {
+            select: jest.fn().mockReturnValue({
+              eq: jest.fn().mockReturnValue({
+                single: jest.fn().mockResolvedValue({
+                  data: { ...activeKeyRecord, is_active: false },
+                  error: null,
+                }),
+              }),
+            }),
+            update: jest.fn().mockReturnValue({ eq: jest.fn().mockResolvedValue({ error: null }) }),
+          } as unknown as ReturnType<typeof mockSupabaseClient.from>;
+        }
+        return { select: jest.fn() } as never;
+      });
+      const secondReqCtx = {
+        switchToHttp: jest.fn().mockReturnValue({
+          getRequest: jest.fn().mockReturnValue({ headers: { 'x-api-key': validApiKey }, ip: '1.2.3.4' }),
+        }),
+        getHandler: jest.fn().mockReturnValue(() => {}),
+      } as unknown as ExecutionContext;
+      await expect(guardWithSharedCache.canActivate(secondReqCtx)).rejects.toMatchObject({
+        response: { code: 'API_KEY_UNAUTHORIZED' },
+      });
     });
   });
 

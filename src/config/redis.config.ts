@@ -21,8 +21,15 @@ export const getRedisConfig = async (configService: ConfigService): Promise<Redi
   const redisUrl = configService.get<string>('REDIS_URL');
   const ttl = configService.get<number>('REPUTATION_CACHE_TTL', 300);
 
-  // If we are in test mode or no Redis URL is provided, fall back to in-memory store
+  // If we are in test mode or no Redis URL is provided, fall back to in-memory store.
+  // In-memory is per-instance and therefore NOT suitable for ApiKeyGuard's
+  // shared invalidation/rate-limiting (revocation and 429 counters become
+  // per-instance). Production must set REDIS_URL; we warn loudly when falling
+  // back outside tests.
   if (isTest || !redisUrl) {
+    if (!isTest && !redisUrl) {
+      pino().warn('REDIS_URL is not set — falling back to in-memory cache. ApiKeyGuard revocation and per-key/per-IP rate limiting will be per-instance only and should not be used in production.');
+    }
     return {
       ttl,
     };

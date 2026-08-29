@@ -56,4 +56,43 @@ describe('AuthWalletThrottlerGuard', () => {
       '198.51.100.9',
     );
   });
+
+  describe('canActivate throttling', () => {
+    beforeEach(() => {
+      AuthWalletThrottlerGuard.clearStorage();
+    });
+
+    function mockContext(req: unknown): import('@nestjs/common').ExecutionContext {
+      return {
+        switchToHttp: () => ({ getRequest: () => req }),
+        getType: () => 'http',
+      } as unknown as import('@nestjs/common').ExecutionContext;
+    }
+
+    it('allows 5 requests per wallet then throws ThrottlerException on 6th', async () => {
+      const guard = createGuard();
+      const wallet = 'GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW';
+      const req = { body: { wallet }, ip: '1.2.3.4' };
+
+      for (let i = 0; i < 5; i++) {
+        await expect(guard.canActivate(mockContext(req))).resolves.toBe(true);
+      }
+      await expect(guard.canActivate(mockContext(req))).rejects.toThrow();
+    });
+
+    it('isolates throttling per wallet', async () => {
+      const guard = createGuard();
+      const walletA = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+      const walletB = 'GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB';
+      const reqA = { body: { wallet: walletA }, ip: '1.2.3.4' };
+      const reqB = { body: { wallet: walletB }, ip: '1.2.3.4' };
+
+      for (let i = 0; i < 5; i++) {
+        await expect(guard.canActivate(mockContext(reqA))).resolves.toBe(true);
+      }
+      await expect(guard.canActivate(mockContext(reqA))).rejects.toThrow();
+      // walletB should still be allowed
+      await expect(guard.canActivate(mockContext(reqB))).resolves.toBe(true);
+    });
+  });
 });

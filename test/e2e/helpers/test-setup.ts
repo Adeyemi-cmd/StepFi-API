@@ -2,6 +2,8 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { ThrottlerModule } from '@nestjs/throttler';
+import { CACHE_MANAGER } from '@nestjs/cache-manager';
+import { CacheModule } from '@nestjs/cache-manager';
 
 import { AuthModule } from '../../../src/modules/auth/auth.module';
 import { LearnersModule } from '../../../src/modules/learners/learners.module';
@@ -342,6 +344,7 @@ export async function buildTestApp(): Promise<{
   const moduleFixture: TestingModule = await Test.createTestingModule({
     imports: [
       ConfigModule.forRoot({ isGlobal: true, ignoreEnvFile: true }),
+      CacheModule.register({ isGlobal: true }),
       ThrottlerModule.forRoot([{ ttl: 60000, limit: 1000 }]),
       AuthModule,
       LearnersModule,
@@ -368,7 +371,7 @@ export async function buildTestApp(): Promise<{
     .useValue(mockContractClient)
     .overrideProvider(ParametersContractClient)
     .useValue(mockContractClient)
-    .overrideProvider('CACHE_MANAGER')
+    .overrideProvider(CACHE_MANAGER)
     .useValue(mockCacheManager)
     .compile();
 

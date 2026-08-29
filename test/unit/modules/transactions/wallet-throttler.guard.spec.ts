@@ -37,4 +37,26 @@ describe('WalletThrottlerGuard', () => {
       '198.51.100.9',
     );
   });
+
+  describe('canActivate throttling', () => {
+    beforeEach(() => {
+      WalletThrottlerGuard.clearStorage();
+    });
+    function mockContext(req: unknown): import('@nestjs/common').ExecutionContext {
+      return {
+        switchToHttp: () => ({ getRequest: () => req }),
+        getType: () => 'http',
+      } as unknown as import('@nestjs/common').ExecutionContext;
+    }
+
+    it('allows 10 requests per wallet then throws on 11th', async () => {
+      const guard = createGuard();
+      const wallet = 'GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW';
+      const req = { user: { wallet }, ip: '1.2.3.4' };
+      for (let i = 0; i < 10; i++) {
+        await expect(guard.canActivate(mockContext(req))).resolves.toBe(true);
+      }
+      await expect(guard.canActivate(mockContext(req))).rejects.toThrow();
+    });
+  });
 });
